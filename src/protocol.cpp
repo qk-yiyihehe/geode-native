@@ -2,6 +2,7 @@
 #include "search.hpp"
 #include "checkpoint.hpp"
 #include "json.hpp"
+#include <algorithm>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -23,7 +24,7 @@ namespace {
 constexpr int kProtocolVersion = 3, kRankingVersion = kRankingRuleVersion;
 constexpr char kEngineVersion[] = "3.0.0";
 
-struct Cancelled {};
+struct ProtocolCancelled {};
 
 double ms(Clock::time_point start) {
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
@@ -37,7 +38,7 @@ double percent(uint64_t done, uint64_t total) {
 }
 
 // 暂停计时在协议层累计；搜索循环只负责协作等待。
-struct Control {
+struct ProtocolControl {
     std::atomic<int> state{};
     std::mutex mutex;
     std::condition_variable changed;
@@ -136,6 +137,17 @@ Options options(const Json &config) {
     o.center_z = b.at("centerZ");
     o.radius = b.at("radiusBlocks");
     o.shape = b.at("shape");
+    if (b.contains("minX") && b.contains("maxX") && b.contains("minZ") && b.contains("maxZ")) {
+        o.search_rect = true;
+        o.min_x = b.at("minX");
+        o.max_x = b.at("maxX");
+        o.min_z = b.at("minZ");
+        o.max_z = b.at("maxZ");
+        o.center_x = int((int64_t(o.min_x) + o.max_x) / 2);
+        o.center_z = int((int64_t(o.min_z) + o.max_z) / 2);
+        o.radius = std::max(o.max_x - o.min_x, o.max_z - o.min_z) / 2 + 1;
+        o.shape = "rect";
+    }
     // fullWorld只是简写，结果必须回显展开后的实际方形范围。
     if (b.value("fullWorld", false))
         expand_full_world(o);
@@ -150,8 +162,10 @@ Options options(const Json &config) {
     if (o.radius < 1 || o.radius > 60000000 || std::abs(int64_t(o.center_x)) > 29999999 ||
         std::abs(int64_t(o.center_z)) > 29999999 || o.threads < 1 || o.threads > 32 || o.limit < 1 || o.limit > 200 ||
         o.min_geodes < 1 || o.min_budding < 0 || o.prefilter < 0 || o.simulation_distance < 2 ||
-        o.simulation_distance > 32 || (o.shape != "circle" && o.shape != "square") ||
-        (o.scan_backend != "auto" && o.scan_backend != "cpu" && o.scan_backend != "gpu"))
+        o.simulation_distance > 32 || (o.shape != "circle" && o.shape != "square" && o.shape != "rect") ||
+        (o.scan_backend != "auto" && o.scan_backend != "cpu" && o.scan_backend != "gpu") ||
+        (o.search_rect && (o.min_x > o.max_x || o.min_z > o.max_z || o.min_x < -30000000 || o.max_x > 29999999 ||
+                           o.min_z < -30000000 || o.max_z > 29999999)))
         throw std::invalid_argument("搜索参数不合法");
     if (o.scan_backend == "gpu" && !o.prefilter)
         throw std::invalid_argument("GPU粗筛需要正数候选预算；全量模式请选择自动或CPU");
@@ -186,6 +200,11 @@ Json result_json(const Options &o, const Results &output, const std::string &job
                    {"centerZ", o.center_z},
                    {"radiusBlocks", o.radius},
                    {"shape", o.shape},
+                   {"searchRect", o.search_rect},
+                   {"minX", o.search_rect ? o.min_x : o.center_x - o.radius},
+                   {"maxX", o.search_rect ? o.max_x : o.center_x + o.radius},
+                   {"minZ", o.search_rect ? o.min_z : o.center_z - o.radius},
+                   {"maxZ", o.search_rect ? o.max_z : o.center_z + o.radius},
                    {"fullWorld", o.full_world}};
     Json params = {{"minGeodes", o.min_geodes},     {"simulationDistanceChunks", o.simulation_distance},
                    {"prefilterLimit", o.prefilter}, {"minBudding", o.min_budding},
@@ -290,7 +309,7 @@ void write_json(const std::string &path, const Json &body) {
 int desktop_protocol() {
     std::mutex output_mutex, stats_mutex;
     std::thread worker;
-    std::shared_ptr<Control> control;
+    std::shared_ptr<ProtocolControl> control;
     std::atomic<bool> active{};
     std::string job;
     uint64_t sequence = 0;
@@ -312,7 +331,7 @@ int desktop_protocol() {
                 active = false;
                 auto config = command.at("config");
                 auto o = options(config);
-                control = std::make_shared<Control>();
+                control = std::make_shared<ProtocolControl>();
                 auto token = control;
                 auto id = job;
                 current = {{"phase", "prepare"},   {"current", 0},        {"total", 1},     {"unit", "文件"},
@@ -407,7 +426,7 @@ int desktop_protocol() {
                             lock.lock();
                         }
                         if (token->state == 2)
-                            throw Cancelled{};
+                            throw ProtocolCancelled{};
                         active = false;
                         remove_checkpoint(found.checkpoint_path);
                         Json p;
@@ -423,7 +442,7 @@ int desktop_protocol() {
                             << Json({{"type", "progress"}, {"jobId", id}, {"progress", p}}).dump() << '\n'
                             << Json({{"type", "done"}, {"jobId", id}, {"result", result}, {"exports", exports}}).dump()
                             << std::endl;
-                    } catch (const Cancelled &) {
+                    } catch (const ProtocolCancelled &) {
                         active = false;
                         emit({{"type", "failed"}, {"jobId", id}, {"code", "cancelled"}, {"message", "搜索已中止"}});
                     } catch (const std::bad_alloc &) {

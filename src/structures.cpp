@@ -11,13 +11,13 @@
 namespace geode {
 namespace {
 struct Mask {
-    trial::Vec3 size;
+    geode_layout::Vec3 size;
     std::vector<std::array<int, 2>> holes;
 };
 
 #include "structure_masks.hpp"
 
-trial::Vec3 rotate(trial::Vec3 p, int r) {
+geode_layout::Vec3 rotate(geode_layout::Vec3 p, int r) {
     switch (r) {
         case 1:
             return {-p.z, p.y, p.x};
@@ -52,26 +52,26 @@ double contribution(int x, int y, int z, int signed_y) {
 struct Structures::Impl {
     uint64_t seed;
     int generation;
-    trial::LayoutEngine engine;
+    geode_layout::LayoutEngine engine;
     const std::vector<Mask> &masks;
-    trial::LayoutEngine city;
+    geode_layout::LayoutEngine city;
 
     struct Start {
-        trial::Point position;
-        trial::Box bounds;
-        std::optional<trial::Chamber> layout;
+        geode_layout::Point position;
+        geode_layout::Box bounds;
+        std::optional<geode_layout::Chamber> layout;
     };
 
     std::unordered_map<uint64_t, Start> regions;
-    std::unordered_map<uint64_t, std::vector<trial::Placed>> chunks;
+    std::unordered_map<uint64_t, std::vector<geode_layout::Placed>> chunks;
     std::unordered_map<uint64_t, Start> cities;
-    std::unordered_map<uint64_t, std::vector<trial::Placed>> beard_chunks, trial_beard_chunks;
+    std::unordered_map<uint64_t, std::vector<geode_layout::Placed>> beard_chunks, layout_beard_chunks;
 
     Impl(uint64_t s, int g)
         : seed(s), generation(g), engine(g, s), masks(g == 1 ? legacy_masks : modern_masks), city(g >= 5 ? 6 : 3, s) {}
 
-    const std::vector<trial::Placed> &beard_pieces(int cx, int cz, bool ancient) {
-        auto &cache = ancient ? beard_chunks : trial_beard_chunks;
+    const std::vector<geode_layout::Placed> &beard_pieces(int cx, int cz, bool ancient) {
+        auto &cache = ancient ? beard_chunks : layout_beard_chunks;
         auto &starts = ancient ? cities : regions;
         auto &layout = ancient ? city : engine;
         int spacing = ancient ? 24 : 34;
@@ -84,20 +84,20 @@ struct Structures::Impl {
             cache.clear();
         if (starts.size() >= 1024)
             starts.clear();
-        std::vector<trial::Placed> found;
+        std::vector<geode_layout::Placed> found;
         int rx = floor_div(cx, spacing), rz = floor_div(cz, spacing);
-        trial::Box padded{{cx * 16 - 12, -64, cz * 16 - 12}, {cx * 16 + 27, 319, cz * 16 + 27}};
+        geode_layout::Box padded{{cx * 16 - 12, -64, cz * 16 - 12}, {cx * 16 + 27, 319, cz * 16 + 27}};
         for (int x = rx - 1; x <= rx + 1; ++x)
             for (int z = rz - 1; z <= rz + 1; ++z) {
                 auto region = key(x, z);
                 auto existing = starts.find(region);
                 if (existing == starts.end()) {
-                    auto p = ancient ? trial::city_placement(seed, x, z) : trial::placement(seed, x, z);
+                    auto p = ancient ? geode_layout::city_placement(seed, x, z) : geode_layout::placement(seed, x, z);
                     existing =
                         starts
                             .emplace(region,
                                      Start{p,
-                                           layout.possible_bounds(trial::floor_div(p.x, 16), trial::floor_div(p.z, 16)),
+                                           layout.possible_bounds(geode_layout::floor_div(p.x, 16), geode_layout::floor_div(p.z, 16)),
                                            {}})
                             .first;
                 }
@@ -105,7 +105,7 @@ struct Structures::Impl {
                 if (!s.bounds.intersects(padded))
                     continue;
                 if (!s.layout)
-                    s.layout = layout.generate(trial::floor_div(s.position.x, 16), trial::floor_div(s.position.z, 16));
+                    s.layout = layout.generate(geode_layout::floor_div(s.position.x, 16), geode_layout::floor_div(s.position.z, 16));
                 for (const auto &source : s.layout->placed) {
                     if (source.box.hi.x < padded.lo.x || source.box.lo.x > padded.hi.x ||
                         source.box.hi.z < padded.lo.z || source.box.lo.z > padded.hi.z)
@@ -120,29 +120,29 @@ struct Structures::Impl {
         return cache.emplace(k, std::move(found)).first->second;
     }
 
-    const std::vector<trial::Placed> &pieces(int cx, int cz) {
+    const std::vector<geode_layout::Placed> &pieces(int cx, int cz) {
         auto k = key(cx, cz);
         auto old = chunks.find(k);
         if (old != chunks.end())
             return old->second;
-        std::vector<trial::Placed> found;
+        std::vector<geode_layout::Placed> found;
         if (chunks.size() >= 8192)
             chunks.clear();
         if (regions.size() >= 1024)
             regions.clear();
         int rx = floor_div(cx, 34), rz = floor_div(cz, 34);
-        trial::Box chunk{{cx * 16, -64, cz * 16}, {cx * 16 + 15, 319, cz * 16 + 15}};
+        geode_layout::Box chunk{{cx * 16, -64, cz * 16}, {cx * 16 + 15, 319, cz * 16 + 15}};
         for (int x = rx - 1; x <= rx + 1; ++x)
             for (int z = rz - 1; z <= rz + 1; ++z) {
                 auto region = key(x, z);
                 auto existing = regions.find(region);
                 if (existing == regions.end()) {
-                    auto p = trial::placement(seed, x, z);
+                    auto p = geode_layout::placement(seed, x, z);
                     existing =
                         regions
                             .emplace(region,
                                      Start{p,
-                                           engine.possible_bounds(trial::floor_div(p.x, 16), trial::floor_div(p.z, 16)),
+                                           engine.possible_bounds(geode_layout::floor_div(p.x, 16), geode_layout::floor_div(p.z, 16)),
                                            {}})
                             .first;
                 }
@@ -150,7 +150,7 @@ struct Structures::Impl {
                 if (!s.bounds.intersects(chunk))
                     continue;
                 if (!s.layout)
-                    s.layout = engine.generate(trial::floor_div(s.position.x, 16), trial::floor_div(s.position.z, 16));
+                    s.layout = engine.generate(geode_layout::floor_div(s.position.x, 16), geode_layout::floor_div(s.position.z, 16));
                 for (const auto &p : s.layout->placed)
                     if (p.box.intersects(chunk))
                         found.push_back(p);
@@ -164,7 +164,7 @@ Structures::Structures(uint64_t seed, int generation) : impl_(std::make_unique<I
 Structures::~Structures() = default;
 
 bool Structures::trial_written(int x, int y, int z) {
-    trial::Vec3 world{x, y, z};
+    geode_layout::Vec3 world{x, y, z};
     for (const auto &p : impl_->pieces(floor_div(x, 16), floor_div(z, 16))) {
         if (!p.box.contains(world))
             continue;

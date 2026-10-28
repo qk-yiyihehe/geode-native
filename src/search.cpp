@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <exception>
 #include <mutex>
 #include <map>
@@ -105,6 +106,16 @@ class SearchCheckpoint {
     std::exception_ptr commit_failure;
     std::vector<bool> scans;
     std::unordered_set<uint64_t> simulations;
+    size_t scan_tiles_x = 0, scan_tiles_z = 0;
+    int scan_width = 0, scan_height = 0;
+    int region_chunks = 0;
+    size_t region_cols = 0, region_rows = 0;
+    std::vector<uint8_t> regions;
+    std::vector<uint32_t> region_remaining;
+    std::vector<uint64_t> region_covered;
+    std::vector<std::vector<Candidate>> region_correct, region_legacy;
+    std::vector<uint8_t> region_gpu;
+    int unit_size = 0, unit_cols = 0, unit_rows = 0, region_units_x = 1, region_units_z = 1;
 
     void times(CheckpointRecord &record) {
         record.put(total_ms());
@@ -128,6 +139,47 @@ class SearchCheckpoint {
         r.put(c.count);
     }
 
+    size_t region_of(size_t unit) const {
+        int col = int(unit % size_t(unit_cols)), row = int(unit / size_t(unit_cols));
+        return size_t(row / region_units_z) * region_cols + size_t(col / region_units_x);
+    }
+
+    void write_region(size_t r) {
+        if (commit_failure)
+            std::rethrow_exception(commit_failure);
+        try {
+            CheckpointRecord record;
+            record.put(uint8_t(4));
+            stats.scan_ms = scan_ms();
+            times(record);
+            record.put(uint64_t(r));
+            record.put(uint8_t(region_gpu[r]));
+            record.put(region_covered[r]);
+            auto add = [&](const std::vector<Candidate> &pending) {
+                record.put(uint32_t(pending.size()));
+                for (auto c : pending)
+                    put_candidate(record, c);
+            };
+            add(region_correct[r]);
+            add(region_legacy[r]);
+            journal->append(record);
+            // 区域记录只在完成后写入；同时把该区域的候选并入全局 Top-K，
+            // 保证不启用断点时也能从 saved.correct/legacy 得到最终候选。
+            for (auto c : region_correct[r])
+                offer(correct, c, o.prefilter);
+            for (auto c : region_legacy[r])
+                offer(legacy, c, o.prefilter);
+            regions[r] = 1;
+            stats.scan_backend = region_gpu[r] ? "gpu" : "cpu";
+            region_correct[r].clear();
+            region_legacy[r].clear();
+            region_covered[r] = 0;
+        } catch (...) {
+            commit_failure = std::current_exception();
+            throw;
+        }
+    }
+
   public:
     Stats stats;
     Heap correct, legacy;
@@ -135,18 +187,33 @@ class SearchCheckpoint {
     std::vector<Candidate> candidates;
     bool scan_complete = false;
 
-    SearchCheckpoint(const Options &options, Clock::time_point begin, size_t scan_count)
-        : o(options), start(begin), scans(o.checkpoint_directory.empty() ? 0 : scan_count) {
+    SearchCheckpoint(const Options &options, Clock::time_point begin, size_t scan_count, int minx, int maxx, int minz,
+                     int maxz)
+        : o(options), start(begin), scans(o.checkpoint_directory.empty() || o.checkpoint_region > 0 ? 0 : scan_count) {
+        int width = std::max(0, maxx - minx + 1), height = std::max(0, maxz - minz + 1);
+        scan_width = width;
+        scan_height = height;
+        scan_tiles_x = size_t((width + 511) / 512);
+        scan_tiles_z = size_t((height + 511) / 512);
         pause_start = o.paused_ms ? o.paused_ms() : 0;
         if (!enabled())
             return;
+        if (o.checkpoint_region > 0) {
+            // 区域断点对齐到搜索范围左上角，与粗筛/模拟的瓦片划分保持一致。
+            region_chunks = std::max(512, o.checkpoint_region);
+            region_cols = (size_t(width) + size_t(region_chunks) - 1) / size_t(region_chunks);
+            region_rows = (size_t(height) + size_t(region_chunks) - 1) / size_t(region_chunks);
+            regions.assign(region_cols * region_rows, 0);
+        }
         // 生成逻辑、归组或任务归属变化时，必须更新模型/工作划分修订。
         std::ostringstream signature;
         signature << "geode-native-v1;model=20261025;work=512-4096-64;int=" << sizeof(int) << ";seed=" << o.seed << ';'
                   << o.version << ';' << o.generation << ';' << o.terrain << ';' << o.modern << ';' << o.center_x << ';'
                   << o.center_z << ';' << o.radius << ';' << o.shape << ';' << o.full_world << ';' << o.tick_radius
                   << ';' << o.simulation_distance << ';' << o.min_geodes << ';' << o.min_budding << ';' << o.prefilter
-                  << ';' << o.limit << ';' << o.threads << ';' << o.scan_backend << ';' << kRankingRuleVersion;
+                  << ';' << o.limit << ';' << o.threads << ';' << o.scan_backend << ';' << kRankingRuleVersion << ';'
+                  << o.search_rect << ';' << o.min_x << ';' << o.max_x << ';' << o.min_z << ';' << o.max_z << ';'
+                  << o.checkpoint_region;
         journal = std::make_unique<CheckpointJournal>(o.checkpoint_directory, signature.str());
         journal->replay([&](CheckpointRecord &record) {
             if (o.checkpoint)
@@ -192,6 +259,18 @@ class SearchCheckpoint {
                 n = record.get<uint32_t>();
                 for (uint32_t i = 0; i < n; ++i)
                     origins.emplace(record.get<uint64_t>(), 1);
+            } else if (kind == 4) {
+                auto id = record.get<uint64_t>();
+                if (o.checkpoint_region <= 0 || id >= regions.size() || regions[size_t(id)] || scan_complete)
+                    throw std::runtime_error("Invalid geode region checkpoint unit");
+                regions[size_t(id)] = 1;
+                stats.scan_backend = record.get<uint8_t>() ? "gpu" : "cpu";
+                stats.scanned += record.get<uint64_t>();
+                for (auto *pool : {&correct, &legacy}) {
+                    auto n = record.get<uint32_t>();
+                    for (uint32_t i = 0; i < n; ++i)
+                        offer(*pool, read_candidate(record), o.prefilter);
+                }
             } else
                 throw std::runtime_error("Unknown geode checkpoint record");
             record.end();
@@ -200,7 +279,8 @@ class SearchCheckpoint {
         scan_history = stats.scan_ms;
         simulation_history = stats.simulate_ms;
         stats.resumed_ms = history;
-        stats.resumed_scan = std::count(scans.begin(), scans.end(), true);
+        if (o.checkpoint_region <= 0)
+            stats.resumed_scan = std::count(scans.begin(), scans.end(), true);
         stats.resumed_simulation = simulations.size();
         if (o.restored)
             o.restored(history, stats.resumed_scan, stats.resumed_simulation);
@@ -226,10 +306,48 @@ class SearchCheckpoint {
         return simulation_history + elapsed(begin) - (pause_ms() - paused_at);
     }
 
+    // 区域断点必须按实际的并行单位（CPU 瓦片 512 / GPU 批次 4096）建立
+    // 每区域剩余单位计数；只把完整区域写入日志，未完成区域重扫。
+    void prepare_regions(int unit) {
+        if (!enabled() || o.checkpoint_region <= 0 || unit_size == unit)
+            return;
+        std::lock_guard lock(mutex);
+        unit_size = unit;
+        unit_cols = (scan_width + unit - 1) / unit;
+        unit_rows = (scan_height + unit - 1) / unit;
+        region_units_x = std::max(1, region_chunks / unit);
+        region_units_z = region_units_x;
+        region_cols = (size_t(unit_cols) + size_t(region_units_x) - 1) / size_t(region_units_x);
+        region_rows = (size_t(unit_rows) + size_t(region_units_z) - 1) / size_t(region_units_z);
+        size_t count = region_cols * region_rows;
+        region_remaining.assign(count, 0);
+        region_covered.assign(count, 0);
+        region_correct.assign(count, {});
+        region_legacy.assign(count, {});
+        region_gpu.assign(count, 0);
+        regions.resize(count, 0);
+        uint64_t completed = 0;
+        for (size_t rz = 0; rz < region_rows; ++rz)
+            for (size_t rx = 0; rx < region_cols; ++rx) {
+                int ux = std::min(region_units_x, unit_cols - int(rx) * region_units_x);
+                int uz = std::min(region_units_z, unit_rows - int(rz) * region_units_z);
+                uint32_t units = uint32_t(std::max(0, ux) * std::max(0, uz));
+                region_remaining[rz * region_cols + rx] = units;
+                if (regions[rz * region_cols + rx])
+                    completed += units;
+            }
+        stats.resumed_scan = completed;
+    }
+
     bool scan_done(size_t id) {
         if (!enabled())
             return false;
         std::lock_guard lock(mutex);
+        if (o.checkpoint_region > 0) {
+            if (!unit_size)
+                return false;
+            return regions[region_of(id)] != 0;
+        }
         return scans.at(id);
     }
 
@@ -251,6 +369,22 @@ class SearchCheckpoint {
         std::lock_guard lock(mutex);
         if (commit_failure)
             std::rethrow_exception(commit_failure);
+        if (o.checkpoint_region > 0) {
+            if (!unit_size)
+                throw std::runtime_error("Geode region checkpoint is not prepared");
+            size_t r = region_of(id);
+            if (regions[r])
+                return;
+            region_covered[r] += covered;
+            if (gpu)
+                region_gpu[r] = 1;
+            region_correct[r].insert(region_correct[r].end(), a.begin(), a.end());
+            region_legacy[r].insert(region_legacy[r].end(), b.begin(), b.end());
+            stats.scanned += covered;
+            if (--region_remaining[r] == 0)
+                write_region(r);
+            return;
+        }
         try {
             CheckpointRecord record;
             record.put(uint8_t(1));
@@ -369,9 +503,58 @@ std::vector<Weight> gather(const Weights &all, int cx, int cz, int radius) {
 }
 }
 
+void Control::checkpoint() {
+    if (cancelled_.load(std::memory_order_relaxed))
+        throw Cancelled{};
+    if (!paused_.load(std::memory_order_relaxed))
+        return;
+    std::unique_lock lock(mutex_);
+    ++waiting_;
+    changed_.wait(lock, [this] {
+        return !paused_.load(std::memory_order_relaxed) || cancelled_.load(std::memory_order_relaxed);
+    });
+    --waiting_;
+    if (cancelled_.load(std::memory_order_relaxed))
+        throw Cancelled{};
+}
+
+void Control::pause() {
+    std::lock_guard lock(mutex_);
+    if (!paused_.load(std::memory_order_relaxed)) {
+        paused_.store(true, std::memory_order_relaxed);
+        paused_at_ = std::chrono::steady_clock::now();
+    }
+}
+
+void Control::resume() {
+    std::lock_guard lock(mutex_);
+    if (paused_.load(std::memory_order_relaxed)) {
+        paused_time_ += std::chrono::steady_clock::now() - paused_at_;
+        paused_.store(false, std::memory_order_relaxed);
+    }
+    changed_.notify_all();
+}
+
+void Control::cancel() {
+    cancelled_.store(true, std::memory_order_relaxed);
+    changed_.notify_all();
+}
+
+double Control::paused_ms() {
+    std::lock_guard lock(mutex_);
+    return std::chrono::duration<double, std::milli>(
+               paused_time_ + (paused_.load(std::memory_order_relaxed) ? std::chrono::steady_clock::now() - paused_at_
+                                                                      : std::chrono::steady_clock::duration{}))
+        .count();
+}
+
+
 bool Options::contains(int x, int z) const {
     if (x < -30000000 || x >= 30000000 || z < -30000000 || z >= 30000000)
         return false;
+    // 矩形四至是闭区间；排名中心与边界裁切都沿用同一判定。
+    if (search_rect)
+        return x >= min_x && x <= max_x && z >= min_z && z <= max_z;
     int64_t dx = int64_t(x) - center_x, dz = int64_t(z) - center_z;
     if (std::abs(dx) > radius || std::abs(dz) > radius)
         return false;
@@ -379,6 +562,15 @@ bool Options::contains(int x, int z) const {
 }
 
 bool Options::intersects_chunk(int x, int z) const {
+    if (search_rect) {
+        // 矩形与区块包围盒求交：哪怕只覆盖区块一角也要保留，
+        // 之后再由 optimize() 把玩家位置夹到矩形内。
+        int64_t left = int64_t(x) * 16, right = left + 15;
+        int64_t top = int64_t(z) * 16, bottom = top + 15;
+        if (right < -30000000 || left > 29999999 || bottom < -30000000 || top > 29999999)
+            return false;
+        return right >= min_x && left <= max_x && bottom >= min_z && top <= max_z;
+    }
     int bx = std::clamp(center_x, x * 16, x * 16 + 15), bz = std::clamp(center_z, z * 16, z * 16 + 15);
     return contains(bx, bz);
 }
@@ -538,34 +730,50 @@ Center evaluate(const Options &o, int px, int pz) {
     return out;
 }
 
-Results search(const Options &o, const std::function<void(const std::string &, uint64_t, uint64_t)> &progress) {
+Results search(const Options &o, const std::function<void(const std::string &, uint64_t, uint64_t)> &progress, const Backend &backend) {
     auto checkpoint = [&] {
         if (o.checkpoint)
             o.checkpoint();
     };
+    if (o.search_rect && (o.min_x > o.max_x || o.min_z > o.max_z || o.min_x < -30000000 ||
+                          o.max_x > 29999999 || o.min_z < -30000000 || o.max_z > 29999999))
+        throw std::invalid_argument("Invalid rectangular search bounds");
     checkpoint();
     auto start = Clock::now();
     Results out;
-    int nthreads = o.threads, r = o.activity_radius() + 1;
-    int minx =
-        std::max(world_min_chunk, floor_div(int(std::max<int64_t>(-30000000, int64_t(o.center_x) - o.radius)), 16));
-    int maxx =
-        std::min(world_max_chunk, floor_div(int(std::min<int64_t>(29999999, int64_t(o.center_x) + o.radius)), 16));
-    int minz =
-        std::max(world_min_chunk, floor_div(int(std::max<int64_t>(-30000000, int64_t(o.center_z) - o.radius)), 16));
-    int maxz =
-        std::min(world_max_chunk, floor_div(int(std::min<int64_t>(29999999, int64_t(o.center_z) + o.radius)), 16));
+    int nthreads = std::clamp(o.threads, 1, 64), r = o.activity_radius() + 1;
+    int scan_threads = std::clamp(o.scan_threads > 0 ? o.scan_threads : nthreads, 1, 256);
+    int minx, maxx, minz, maxz;
+    if (o.search_rect) {
+        minx = std::max(world_min_chunk, floor_div(std::max(-30000000, o.min_x), 16));
+        maxx = std::min(world_max_chunk, floor_div(std::min(29999999, o.max_x), 16));
+        minz = std::max(world_min_chunk, floor_div(std::max(-30000000, o.min_z), 16));
+        maxz = std::min(world_max_chunk, floor_div(std::min(29999999, o.max_z), 16));
+    } else {
+        minx = std::max(world_min_chunk,
+                        floor_div(int(std::max<int64_t>(-30000000, int64_t(o.center_x) - o.radius)), 16));
+        maxx = std::min(world_max_chunk,
+                        floor_div(int(std::min<int64_t>(29999999, int64_t(o.center_x) + o.radius)), 16));
+        minz = std::max(world_min_chunk,
+                        floor_div(int(std::max<int64_t>(-30000000, int64_t(o.center_z) - o.radius)), 16));
+        maxz = std::min(world_max_chunk,
+                        floor_div(int(std::min<int64_t>(29999999, int64_t(o.center_z) + o.radius)), 16));
+    }
+    // 完整候选模式会枚举并保存每个区块；超大范围必须先给候选预算，
+    // 否则会在模拟前耗尽内存。
+    if (!o.prefilter && int64_t(maxx - minx + 1) * int64_t(maxz - minz + 1) > 16'000'000)
+        throw std::invalid_argument("Complete candidate mode requires a candidate budget for this range");
     constexpr int tile_size = 512;
     int tiles_x = (maxx - minx + tile_size) / tile_size, tiles_z = (maxz - minz + tile_size) / tile_size;
-    SearchCheckpoint saved(o, start, size_t(tiles_x) * tiles_z);
+    SearchCheckpoint saved(o, start, size_t(tiles_x) * tiles_z, minx, maxx, minz, maxz);
     out.stats = saved.stats;
     out.checkpoint_path = saved.path();
-    std::vector<Heap> correct(nthreads), legacy(nthreads);
+    std::vector<Heap> correct(scan_threads), legacy(scan_threads);
     std::vector<Simulator> scan_engines;
-    for (int i = 0; i < nthreads; ++i)
+    for (int i = 0; i < scan_threads; ++i)
         scan_engines.emplace_back(o.seed, o.generation);
     if (!saved.scan_complete)
-        for (int i = 0; i < nthreads; ++i) {
+        for (int i = 0; i < scan_threads; ++i) {
             correct[i] = saved.correct;
             legacy[i] = saved.legacy;
         }
@@ -590,13 +798,15 @@ Results search(const Options &o, const std::function<void(const std::string &, u
             progress("scan", scanned, scanned);
     } else {
         bool gpu = false;
+        std::string gpu_failure;
         // 约十亿区块以下，GPU初始化和首次回传会抵消较多计算收益。
         std::vector<Candidate> gpu_correct, gpu_legacy;
+        const uint64_t chunks = uint64_t(maxx - minx + 1) * (maxz - minz + 1);
+        bool gpu_requested = o.scan_backend == "gpu" || (o.scan_backend == "auto" && chunks >= 1000000000ULL);
+        saved.prepare_regions(gpu_requested ? 4096 : 512);
+        done.store(saved.stats.resumed_scan);
         bool partial_gpu = saved.stats.resumed_scan && saved.stats.scan_backend == "gpu";
-        if (partial_gpu ||
-            (!saved.stats.resumed_scan &&
-             (o.scan_backend == "gpu" ||
-              (o.scan_backend == "auto" && uint64_t(maxx - minx + 1) * (maxz - minz + 1) >= 1000000000ULL)))) {
+        if (partial_gpu || (!saved.stats.resumed_scan && gpu_requested)) {
             gpu = gpu_scan(
                 o, minx, maxx, minz, maxz,
                 [&] {
@@ -606,7 +816,8 @@ Results search(const Options &o, const std::function<void(const std::string &, u
                     return cut;
                 },
                 [&](int x, int z, int a, int b) {
-                    if (a >= o.min_geodes && offer(correct[0], {x, z, a}, o.prefilter) && saved.enabled())
+                    if (a >= o.min_geodes && o.intersects_chunk(x, z) &&
+                        offer(correct[0], {x, z, a}, o.prefilter) && saved.enabled())
                         gpu_correct.push_back({x, z, a});
                     if (b >= o.min_geodes && o.contains(x * 16 + 8, z * 16 + 8) &&
                         offer(legacy[0], {x, z, b}, o.prefilter) && saved.enabled())
@@ -623,16 +834,20 @@ Results search(const Options &o, const std::function<void(const std::string &, u
                     saved.scan_commit(size_t(id), covered, true, gpu_correct, gpu_legacy);
                     gpu_correct.clear();
                     gpu_legacy.clear();
-                });
+                },
+                &gpu_failure, [&](const std::string &device) { if (backend) backend("gpu", device); });
+            if (backend && !gpu) backend("cpu", gpu_failure);
             if (!gpu && (o.scan_backend == "gpu" || partial_gpu))
                 throw std::runtime_error(
                     "No compatible OpenCL GPU for this footprint/checkpoint; use a separate CPU checkpoint");
             if (gpu) {
                 out.stats.scan_backend = "gpu";
-                scanned = uint64_t(maxx - minx + 1) * (maxz - minz + 1);
+                scanned = chunks;
             }
         }
         if (!gpu) {
+            saved.prepare_regions(512);
+            done.store(saved.stats.resumed_scan);
             struct Span {
                 int z, lo, hi;
             };
@@ -652,7 +867,7 @@ Results search(const Options &o, const std::function<void(const std::string &, u
                     }
                 }
             }
-            parallel(size_t(tiles_x) * tiles_z, nthreads, [&](size_t tile, int id) {
+            parallel(size_t(tiles_x) * tiles_z, scan_threads, [&](size_t tile, int id) {
                 checkpoint();
                 if (saved.scan_done(tile))
                     return;
@@ -789,7 +1004,7 @@ Results search(const Options &o, const std::function<void(const std::string &, u
             a = std::move(saved.correct);
             b = std::move(saved.legacy);
         } else
-            for (int i = 0; i < nthreads; ++i) {
+            for (int i = 0; i < scan_threads; ++i) {
                 while (!correct[i].empty()) {
                     if (correct[i].size() % 256 == 0)
                         checkpoint();
@@ -828,6 +1043,8 @@ Results search(const Options &o, const std::function<void(const std::string &, u
     out.stats.candidates = candidates.size();
     out.stats.scan_ms = saved.scan_complete ? saved.stats.scan_ms : saved.scan_ms();
     saved.scan_finish(candidates, out.stats);
+    out.approximate = o.prefilter != 0;
+    out.scan_backend = out.stats.scan_backend;
 #ifdef GEODE_SCAN_PROBE
     for (auto c : candidates)
         out.centers.push_back({c.x, c.z, c.count, 0});
@@ -1097,5 +1314,30 @@ Results search(const Options &o, const std::function<void(const std::string &, u
     out.stats.rank_ms = elapsed(rank_start) - (saved.pause_ms() - rank_paused);
     out.stats.total_ms = saved.total_ms();
     return out;
+}
+
+Results search(const Options &options, Control &control, const Progress &progress, const Backend &backend) {
+    Options o = options;
+    auto legacy = o.checkpoint;
+    o.checkpoint = [&] {
+        if (legacy)
+            legacy();
+        control.checkpoint();
+    };
+    o.paused_ms = [&control] {
+        return control.paused_ms();
+    };
+    auto start = Clock::now();
+    try {
+        return search(o, progress, backend);
+    } catch (const Cancelled &) {
+        // 取消是正常终止：已完成的断点保留，内存结果由宿主丢弃。
+        Results out;
+        out.cancelled = true;
+        out.approximate = o.prefilter != 0;
+        out.stats.total_ms = elapsed(start) - control.paused_ms();
+        out.stats.scan_ms = out.stats.total_ms;
+        return out;
+    }
 }
 }

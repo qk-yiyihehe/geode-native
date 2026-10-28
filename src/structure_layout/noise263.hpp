@@ -2,7 +2,7 @@
 #include <cmath>
 #include <cstdint>
 
-namespace trial::noise263 {
+namespace geode_layout::noise263 {
 inline double wrap(double v) {
     return v - std::floor(v / 33554432.0 + 0.5) * 33554432.0;
 }

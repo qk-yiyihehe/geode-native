@@ -17,7 +17,7 @@ using climate_noise::xNextLong;
 using climate_noise::xSetSeed;
 using climate_noise::xPerlinInit;
 
-namespace trial::climate263_model {
+namespace geode_layout::climate263_model {
 enum class Op { Constant, Add, Mul, Abs, Lerp, ShiftA, ShiftB, Shifted, Spline, YGradient };
 
 struct Node {
@@ -40,7 +40,7 @@ struct NoiseSpec {
 
 #include "climate263_data.hpp"
 
-namespace trial {
+namespace geode_layout {
 using namespace climate263_model;
 
 struct Climate263::Impl {

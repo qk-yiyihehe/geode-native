@@ -1,6 +1,6 @@
 // 26.3派生系数与原生算子图，不包含官方资源。
 #pragma once
-namespace trial::climate263_model {
+namespace geode_layout::climate263_model {
 inline const std::vector<Node> nodes={
 {Op::YGradient,-1,-1,-1,-1,-64.0,320.0,1.5,-1.5},
 {Op::Constant,-1,-1,-1,-1,1.0,0.0,0.0,0.0},

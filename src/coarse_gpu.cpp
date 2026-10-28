@@ -193,30 +193,57 @@ constexpr const char *kernel = R"CLC(
 bool gpu_scan(const Options &o, int minx, int maxx, int minz, int maxz, const std::function<int()> &threshold,
               const std::function<void(int, int, int, int)> &offer,
               const std::function<void(uint64_t, uint64_t)> &progress, const std::function<bool(uint64_t)> &completed,
-              const std::function<void(uint64_t, uint64_t)> &commit) {
+              const std::function<void(uint64_t, uint64_t)> &commit, std::string *failure_reason,
+              const std::function<void(const std::string &)> &on_device) {
+    auto fail = [&](const char *why) {
+        if (failure_reason) *failure_reason = why;
+        return false;
+    };
     API api;
     if (!api.load())
-        return false;
+        return fail("no-opencl");
     UInt size = 0;
     int status = api.clGetPlatformIDs(0, nullptr, &size);
     if (status == -1001 || !size)
-        return false;
+        return fail("no-opencl");
     check(status);
     std::vector<Handle> platforms(size);
     check(api.clGetPlatformIDs(size, platforms.data(), nullptr));
-    Handle device = nullptr;
-    for (auto p : platforms)
-        if (api.clGetDeviceIDs(p, 4, 1, &device, nullptr) == 0)
-            break;
-    if (!device)
-        return false;
     int q = o.activity_radius(), side = 16 + 2 * q;
+    // Try every platform/device pair: hybrid laptops often list the iGPU first,
+    // and a device whose local memory is too small must not force a CPU fallback
+    // while another GPU could run the kernel.
+    Handle device = nullptr;
     ULong local_memory = 0;
     size_t group_size = 0;
-    check(api.clGetDeviceInfo(device, 0x1023, sizeof(local_memory), &local_memory, nullptr));
-    check(api.clGetDeviceInfo(device, 0x1004, sizeof(group_size), &group_size, nullptr));
-    if (group_size < 256 || uint64_t(side) * side * 4 > local_memory)
-        return false;
+    char name_buffer[256] = {};
+    for (auto p : platforms) {
+        UInt count = 0;
+        if (api.clGetDeviceIDs(p, 4, 0, nullptr, &count) != 0 || count == 0)
+            continue;
+        std::vector<Handle> devices(count);
+        if (api.clGetDeviceIDs(p, 4, count, devices.data(), nullptr) != 0)
+            continue;
+        for (auto candidate : devices) {
+            ULong memory = 0;
+            size_t group = 0;
+            if (api.clGetDeviceInfo(candidate, 0x1023, sizeof(memory), &memory, nullptr) != 0)
+                continue;
+            if (api.clGetDeviceInfo(candidate, 0x1004, sizeof(group), &group, nullptr) != 0)
+                continue;
+            if (group < 256 || uint64_t(side) * side * 4 > memory)
+                continue;
+            device = candidate;
+            local_memory = memory;
+            group_size = group;
+            api.clGetDeviceInfo(candidate, 0x102B, sizeof(name_buffer), name_buffer, nullptr);
+            break;
+        }
+        if (device)
+            break;
+    }
+    if (!device)
+        return fail("no-device");
     std::ostringstream code;
     code << "#define MODERN " << int(o.modern) << "\n#define Q " << q << "\n#define SIDE " << side
          << "\n__constant int2 spans[" << 2 * q + 1 << "]={";
@@ -265,6 +292,9 @@ bool gpu_scan(const Options &o, int minx, int maxx, int minz, int maxz, const st
     check(error);
     s.count = api.clCreateKernel(s.program, "count", &error);
     check(error);
+    // The device is selected and the kernel is built: from here the scan really
+    // runs on the GPU, so report it before the (long) batch loop starts.
+    if (on_device) on_device(std::string(name_buffer));
     constexpr int batch = 4096;
 
     struct Point {
@@ -355,7 +385,8 @@ bool gpu_scan(const Options &o, int minx, int maxx, int minz, int maxz, const st
 namespace geode {
 bool gpu_scan(const Options &, int, int, int, int, const std::function<int()> &,
               const std::function<void(int, int, int, int)> &, const std::function<void(uint64_t, uint64_t)> &,
-              const std::function<bool(uint64_t)> &, const std::function<void(uint64_t, uint64_t)> &) {
+              const std::function<bool(uint64_t)> &, const std::function<void(uint64_t, uint64_t)> &,
+              std::string *) {
     return false;
 }
 }
