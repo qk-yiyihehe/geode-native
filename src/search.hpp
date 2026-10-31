@@ -64,6 +64,11 @@ bool final_better(int center_x, int center_z, Center a, Center b);
 struct Stats {
     uint64_t scanned = 0, candidates = 0, simulated = 0, weights = 0, pruned = 0, rejected = 0, hotspots = 0,
              optimized = 0, resumed_scan = 0, resumed_simulation = 0;
+    // 两段式裁剪：石模型（无地形）先算母岩数上界，只有上界仍可能进榜的候选才跑地形。
+    // stone_simulated 是上界那一遍的模拟次数，simulated 只统计地形那一遍。
+    uint64_t stone_simulated = 0, two_pass_kept = 0;
+    int two_pass_excluded_bound = 0, two_pass_floor_bound = 0;
+    bool two_pass = false, two_pass_retried = false;
     double scan_ms = 0, simulate_ms = 0, rank_ms = 0, total_ms = 0, resumed_ms = 0;
     std::string scan_backend = "cpu";
 };
@@ -74,5 +79,9 @@ struct Results {
     std::string checkpoint_path;
 };
 
-Results search(const Options &o, const std::function<void(const std::string &, uint64_t, uint64_t)> &progress = {});
+// 进度回调：阶段名、阶段内完成量、阶段内总量、已扫描区块数。
+// 第四个参数让界面在运行中显示真实扫描量，而不是等结果才知道。
+using ProgressFn = std::function<void(const std::string &, uint64_t, uint64_t, uint64_t)>;
+
+Results search(const Options &o, const ProgressFn &progress = {});
 }

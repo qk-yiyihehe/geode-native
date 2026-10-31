@@ -22,7 +22,7 @@ namespace fs = std::filesystem;
 
 namespace {
 constexpr int kProtocolVersion = 3, kRankingVersion = kRankingRuleVersion;
-constexpr char kEngineVersion[] = "3.2.1";
+constexpr char kEngineVersion[] = "3.4.0";
 
 struct Cancelled {};
 
@@ -240,6 +240,13 @@ Json result_json(const Options &o, const Results &output, const std::string &job
         {"verified", false},
         {"searchApproximate", o.prefilter != 0},
         {"mcVersion", o.version}};
+    // 两段式裁剪统计：stoneGeodes 是"上界"那一遍的模拟次数，
+    // simulatedGeodes 只统计地形那一遍；twoPass 表示本次是否启用裁剪。
+    result["stats"]["stoneGeodes"] = s.stone_simulated;
+    result["stats"]["twoPass"] = s.two_pass;
+    result["stats"]["twoPassKeptCandidates"] = s.two_pass_kept;
+    result["stats"]["twoPassExcludedBound"] = s.two_pass_excluded_bound;
+    result["stats"]["twoPassRetried"] = s.two_pass_retried;
     return result;
 }
 }
@@ -347,48 +354,105 @@ int desktop_protocol() {
                         running.restored = [&](double history, uint64_t, uint64_t) {
                             restored_ms = history;
                         };
-                        auto progress = [&](const std::string &phase, uint64_t done, uint64_t total) {
+                        // 引擎只报「阶段 + 条数 + 已扫描区块」；吞吐、剩余和总体估计在这里按实测速率算。
+                        // 各阶段总量不同，不能拿某个阶段的百分比冒充整轮进度。
+                        struct Live {
+                            std::string phase;
+                            double started = 0;   // 进入本阶段时的任务耗时
+                            Clock::time_point sampled = Clock::now();
+                            uint64_t last_done = 0;
+                            double rate = 0;      // 阶段内单位/毫秒
+                            double overall = 0;   // 单调不减的总体估计
+                        } live;
+                        auto progress = [&](const std::string &phase, uint64_t done, uint64_t total,
+                                            uint64_t scanned) {
                             token->check();
                             auto now = Clock::now();
                             double elapsed_ms = restored_ms + ms(task_start) - token->paused();
-                            Json p = {{"phase", phase == "scan"       ? "coarse"
-                                                : phase == "simulate" ? "verify"
-                                                                      : phase},
+                            std::string name = phase == "scan"       ? "coarse"
+                                               : phase == "simulate" ? "verify"
+                                                                     : phase;
+                            if (live.phase != phase) {
+                                live.phase = phase;
+                                live.started = elapsed_ms;
+                                live.sampled = now;
+                                live.last_done = done;
+                                live.rate = 0;
+                            }
+                            double span = std::chrono::duration<double, std::milli>(now - live.sampled).count();
+                            if (span >= 40 && done > live.last_done) {
+                                double instant = double(done - live.last_done) / span;
+                                live.rate = live.rate > 0 ? live.rate * 0.6 + instant * 0.4 : instant;
+                                live.sampled = now;
+                                live.last_done = done;
+                            }
+                            double remaining_ms = 0;
+                            bool estimated = false;
+                            double phase_left = live.rate > 0 && total > done ? double(total - done) / live.rate : 0;
+                            if (name == "stone") {
+                                // 第二遍的规模要等第一遍跑完才知道；实测第二遍耗时约为第一遍的
+                                // 0.3~1.7 倍，这里取 2 倍留余量，进入第二遍后立即改用真实总量。
+                                double stone_all = (elapsed_ms - live.started) + phase_left;
+                                remaining_ms = phase_left + 2.0 * stone_all + 300;
+                                estimated = true;
+                            } else if (name == "verify") {
+                                remaining_ms = phase_left + std::max(300.0, elapsed_ms * 0.01);
+                                estimated = true;
+                            } else if (name == "rank") {
+                                remaining_ms = phase_left + 200;
+                                estimated = true;
+                            } else if (name == "report") {
+                                remaining_ms = 100;
+                                estimated = true;
+                            }
+                            double overall = live.overall;
+                            if (estimated) {
+                                double value = 100.0 * elapsed_ms / (elapsed_ms + remaining_ms);
+                                overall = std::max(live.overall, std::min(99.9, value));
+                                live.overall = overall;
+                            }
+                            Json p = {{"phase", name},
                                       {"current", done},
                                       {"total", total},
                                       {"unit", phase == "scan"       ? "分片"
-                                               : phase == "simulate" ? "模拟分区"
+                                               : (phase == "simulate" || phase == "stone") ? "模拟分区"
                                                : phase == "rank"     ? "候选"
                                                : phase == "prepare"  ? "阶段"
                                                                      : "文件"},
                                       {"percentage", percent(done, total)},
-                                      {"speedPerSecond", 0},
+                                      {"speedPerSecond", live.rate * 1000.0},
                                       {"elapsedMs", elapsed_ms},
-                                      {"etaMs", 0},
+                                      {"etaMs", estimated ? int64_t(remaining_ms) : int64_t(0)},
+                                      {"scannedChunks", int64_t(scanned)},
                                       {"foundCandidates", 0},
                                       {"state", "running"},
                                       {"message", phase == "scan"       ? "晶洞分布粗筛"
-                                                  : phase == "simulate" ? "局部地形与母岩估计"
+                                                  : phase == "stone"    ? "纯几何上界，不做地形模拟"
+                                                  : phase == "simulate" ? "含地形模拟，决定最终榜单"
                                                   : phase == "rank"     ? "热点精排"
                                                                         : "整理搜索结果"}};
-                            // 当前阶段总量不能估计后续地形模拟和排名的剩余工作。
+                            if (estimated)
+                                p["overallPercentage"] = std::round(overall * 10) / 10;
                             {
                                 std::lock_guard lock(stats_mutex);
                                 current = p;
                             }
                             std::lock_guard lock(output_mutex);
-                            if (token->state == 0 && (now - last >= std::chrono::milliseconds(70) || done == total)) {
+                            // report 是瞬时阶段，节流会把唯一一帧吞掉，界面就整段缺失该阶段。
+                            const bool report_phase = phase == "report";
+                            if (token->state == 0 &&
+                                (report_phase || now - last >= std::chrono::milliseconds(70) || done == total)) {
                                 std::cout << Json({{"type", "progress"}, {"jobId", id}, {"progress", p}}).dump()
                                           << std::endl;
                                 last = now;
                             }
                         };
-                        progress("prepare", 0, 1);
+                        progress("prepare", 0, 1, 0);
                         auto found = search(running, progress);
                         double paused = token->paused();
                         double search_ms = found.stats.total_ms;
                         token->check();
-                        progress("report", 0, 1);
+                        progress("report", 0, 1, found.stats.scanned);
                         auto result = result_json(o, found, id, search_ms, paused);
                         bool defer_export = config.value("deferExport", false);
                         Json exports;
@@ -412,6 +476,7 @@ int desktop_protocol() {
                                   {"batch", batch},
                                   {"totalFound", values.size()}});
                         }
+                        progress("report", 1, 1, found.stats.scanned);
                         token->check();
                         std::unique_lock lock(output_mutex);
                         while (token->state == 1) {

@@ -227,7 +227,7 @@ int run(int argc, char **argv) {
         }
         auto task_start = std::chrono::steady_clock::now(), last = task_start;
         bool jsonl = args.contains("--jsonl");
-        auto output = search(o, [&](const std::string &phase, uint64_t done, uint64_t total) {
+        auto output = search(o, [&](const std::string &phase, uint64_t done, uint64_t total, uint64_t) {
             auto now = std::chrono::steady_clock::now();
             if (done != total && now - last < std::chrono::milliseconds(200))
                 return;
@@ -298,6 +298,11 @@ int run(int argc, char **argv) {
             {"searchMs", s.total_ms}, {"pausedMs", 0}, {"resumedMs", s.resumed_ms}, {"totalMs", s.total_ms}};
         result["stats"]["resumedCoarseUnits"] = s.resumed_scan;
         result["stats"]["resumedSimulationUnits"] = s.resumed_simulation;
+        result["stats"]["stoneGeodes"] = s.stone_simulated;
+        result["stats"]["twoPass"] = s.two_pass;
+        result["stats"]["twoPassKeptCandidates"] = s.two_pass_kept;
+        result["stats"]["twoPassExcludedBound"] = s.two_pass_excluded_bound;
+        result["stats"]["twoPassRetried"] = s.two_pass_retried;
         // 与桌面入口共用最终中心列表和导出函数，生成三份文件；随后
         // 直接输出同一个JSON对象，并保留csv/json兼容键。jsonl模式
         // 在写文件前标记done事件，使文件与标准输出保持一致。
