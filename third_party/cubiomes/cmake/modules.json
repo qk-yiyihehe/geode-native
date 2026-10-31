@@ -1,0 +1,22 @@
+{
+  "Noise": {
+    "sources": ["noise.c"],
+    "dependencies": [],
+    "headers": ["rng.h", "noise.h"]
+  },
+  "Biomes": {
+    "sources": ["generator.c", "biomenoise.c", "biomes.c", "layers.c"],
+    "dependencies": ["Noise"],
+    "headers": []
+  },
+  "Structures": {
+    "sources": ["finders.c", "terrainnoise.c", "util.c", "features/abandoned_camp.c", "features/end_city.c", "features/fortress.c", "features/stronghold.c", "features/mineshaft.c"],
+    "dependencies": ["Biomes"],
+    "headers": []
+  },
+  "Java263": {
+    "sources": [],
+    "dependencies": ["Noise"],
+    "headers": ["extensions/java263_noise.hpp", "extensions/LICENSE"]
+  }
+}

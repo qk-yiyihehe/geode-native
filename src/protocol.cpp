@@ -1,4 +1,5 @@
 #include "protocol.hpp"
+#include "range_units.hpp"
 #include "search.hpp"
 #include "checkpoint.hpp"
 #include "json.hpp"
@@ -21,7 +22,7 @@ namespace fs = std::filesystem;
 
 namespace {
 constexpr int kProtocolVersion = 3, kRankingVersion = kRankingRuleVersion;
-constexpr char kEngineVersion[] = "3.0.0";
+constexpr char kEngineVersion[] = "3.2.1";
 
 struct Cancelled {};
 
@@ -134,7 +135,7 @@ Options options(const Json &config) {
     auto p = config.at("params");
     o.center_x = b.at("centerX");
     o.center_z = b.at("centerZ");
-    o.radius = b.at("radiusBlocks");
+    o.radius = range_units::field(b, "radius", "radiusBlocks", 100000);
     o.shape = b.at("shape");
     // fullWorld只是简写，结果必须回显展开后的实际方形范围。
     if (b.value("fullWorld", false))
@@ -144,10 +145,13 @@ Options options(const Json &config) {
     set_version(o, p.at("mcVersion"));
     o.min_geodes = p.value("minGeodes", 1);
     o.min_budding = p.value("minBudding", 1);
-    o.simulation_distance = p.value("simulationDistanceChunks", 10);
+    o.simulation_distance = range_units::field(p, "simulationDistance", "simulationDistanceChunks", 10, true);
+    o.coverage = p.value("coverage", std::string("game"));
+    o.inner_radius = range_units::field(p, "innerRadius", "innerRadiusBlocks", 128);
     o.prefilter = p.value("prefilterLimit", 200000);
     o.scan_backend = p.value("scanBackend", std::string("auto"));
-    if (o.radius < 1 || o.radius > 60000000 || std::abs(int64_t(o.center_x)) > 29999999 ||
+    if ((o.coverage != "game" && o.coverage != "circle" && o.coverage != "square") ||
+        o.inner_radius > 60000000 || o.radius < 1 || o.radius > 60000000 || std::abs(int64_t(o.center_x)) > 29999999 ||
         std::abs(int64_t(o.center_z)) > 29999999 || o.threads < 1 || o.threads > 32 || o.limit < 1 || o.limit > 200 ||
         o.min_geodes < 1 || o.min_budding < 0 || o.prefilter < 0 || o.simulation_distance < 2 ||
         o.simulation_distance > 32 || (o.shape != "circle" && o.shape != "square") ||
@@ -166,11 +170,11 @@ Json candidate(const Options &o, int rank, Center c) {
             {"x", c.x},
             {"z", c.z},
             {"score", c.budding},
-            {"scoreUnit", "预计活跃母岩"},
+            {"scoreUnit", o.custom() ? "预计范围内母岩" : "预计活跃母岩"},
             {"distance", double(distance_tenths(o.center_x, o.center_z, c.x, c.z)) / 10},
             {"distanceSq", center_distance_sq(o.center_x, o.center_z, c.x, c.z)},
             {"secondary", c.geodes},
-            {"secondaryUnit", "活跃晶洞"},
+            {"secondaryUnit", o.custom() ? "范围内晶洞" : "活跃晶洞"},
             {"bestPlayer", {{"x", c.x}, {"z", c.z}}},
             {"tpCommand", "/tp @s " + std::to_string(c.x) + " ~ " + std::to_string(c.z)},
             {"verified", false}};
@@ -190,6 +194,10 @@ Json result_json(const Options &o, const Results &output, const std::string &job
     Json params = {{"minGeodes", o.min_geodes},     {"simulationDistanceChunks", o.simulation_distance},
                    {"prefilterLimit", o.prefilter}, {"minBudding", o.min_budding},
                    {"scanBackend", o.scan_backend}, {"mcVersion", o.version}};
+    if (o.custom()) {
+        params["coverage"] = o.coverage;
+        params["innerRadiusBlocks"] = o.inner_radius;
+    }
     // 精排始终用CPU；GPU粗筛对应cpu+gpu，原始设备保留在stats.scanBackend。
     Json result = {
         {"jobId", job},
@@ -201,6 +209,7 @@ Json result_json(const Options &o, const Results &output, const std::string &job
         {"finderGeneration", o.version},
         {"engine", "geode-native"},
         {"engineVersion", kEngineVersion},
+        {"cubiomesCommit", CUBIOMES_REVISION},
         {"bounds", bounds},
         {"params", params},
         {"threads", o.threads},
@@ -249,9 +258,13 @@ Exported export_results(const Options &o, const std::vector<Center> &centers, co
     paths.txt = utf8_text(base) + ".txt";
     paths.json = utf8_text(base) + ".json";
     std::ostringstream table, text;
-    table << "\xef\xbb\xbf排名;中心X;中心Z;中心区块X;中心区块Z;预计活跃母岩;活跃晶洞;距搜索中心距离;验证状态\r\n";
+    std::string buddingLabel = o.custom() ? "预计范围内母岩" : "预计活跃母岩";
+    std::string geodeLabel = o.custom() ? "范围内晶洞" : "活跃晶洞";
+    table << "\xef\xbb\xbf排名;中心X;中心Z;中心区块X;中心区块Z;" << buddingLabel << ';' << geodeLabel
+          << ";距搜索中心距离;验证状态\r\n";
     text
-        << "原生局部地形模型估计，未经游戏验证；传送指令保留当前Y坐标。\n排名\t中心X\t中心Z\t预计活跃母岩\t活跃晶洞\t距搜索中心距离\n";
+        << "原生局部地形模型估计，未经游戏验证；传送指令保留当前Y坐标。\n排名\t中心X\t中心Z\t"
+        << buddingLabel << '\t' << geodeLabel << "\t距搜索中心距离\n";
     int rank = 0;
     for (auto c : centers) {
         auto tenths = distance_text(o.center_x, o.center_z, c.x, c.z);
@@ -458,7 +471,13 @@ int desktop_protocol() {
         }
     }
     if (worker.joinable()) {
-        control->set(2);
+        /* ⚠️ 不要在这里 control->set(2)（=取消）。
+         *
+         * 曾经写成「stdin 一关闭就置取消」，结果单行 start 输入（stdin 立即 EOF）
+         * 的任务刚跑完就被判成 cancelled，done 帧缺失、桌面端把它当失败。
+         * 桌面端在任务结束前一直持有 stdin；即使提前 EOF 也应等任务**自然跑完**。
+         * 取消是显式命令（cancel 分支），不能由 EOF 隐式触发。
+         * 女巫小屋、河流、试炼的协议里也踩过同一个坑，修法一致。 */
         worker.join();
     }
     return 0;

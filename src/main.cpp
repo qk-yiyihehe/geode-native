@@ -3,6 +3,8 @@
 #include "checkpoint.hpp"
 #include "terrain.hpp"
 #include "json.hpp"
+#include "range_units.hpp"
+#include "cli_config.hpp"
 #include <algorithm>
 #include <bit>
 #include <chrono>
@@ -25,13 +27,6 @@ using namespace geode;
 namespace {
 fs::path path_utf8(const std::string &s) {
     return fs::path(std::u8string(reinterpret_cast<const char8_t *>(s.data()), s.size()));
-}
-
-std::string trim(std::string v) {
-    auto a = v.find_first_not_of(" \t\r\n\xef\xbb\xbf");
-    if (a == std::string::npos)
-        return {};
-    return v.substr(a, v.find_last_not_of(" \t\r\n") - a + 1);
 }
 
 int integer(const std::string &s) {
@@ -68,7 +63,13 @@ Json sample_json(const Json &query, Options base) {
     if (query.contains("version"))
         set_version(base, query.at("version").get<std::string>());
     if (query.contains("simulationDistance"))
-        base.simulation_distance = query.at("simulationDistance").get<int>();
+        base.simulation_distance = range_units::read(query.at("simulationDistance"), true);
+    base.coverage = query.value("coverage", base.coverage);
+    if (query.contains("innerRadius"))
+        base.inner_radius = range_units::read(query.at("innerRadius"));
+    if ((base.coverage != "game" && base.coverage != "circle" && base.coverage != "square") ||
+        base.inner_radius < 0 || base.inner_radius > 60000000)
+        throw std::invalid_argument("覆盖模式必须为game/circle/square，半径为0–60000000格");
     if (base.simulation_distance < 2 || base.simulation_distance > 32)
         throw std::invalid_argument("Simulation distance must be 2..32");
     if (query.contains("playerX")) {
@@ -92,94 +93,89 @@ int run(int argc, char **argv) {
         for (int i = 1; i < argc; ++i)
             if (std::string(argv[i]) == "--desktop")
                 return desktop_protocol();
+        auto command = cli_config::arguments(std::vector<std::string>(argv + 1, argv + argc));
         std::map<std::string, std::string> args;
-        for (int i = 1; i < argc; ++i) {
-            std::string k = argv[i];
-            if (k == "--help" || k == "--jsonl" || k == "--no-checkpoint")
+        for (size_t i = 0; i < command.size(); ++i) {
+            const auto &k = command[i];
+            if (k == "--versions" || k == "--help" || k == "--jsonl" || k == "--no-checkpoint" || k == "--full-world")
                 args[k] = "true";
             else {
-                if (!k.starts_with("--") || i + 1 >= argc)
+                if (!k.starts_with("--") || i + 1 >= command.size())
                     throw std::invalid_argument("Expected --option value");
-                args[k] = argv[++i];
+                args[k] = command[++i];
             }
         }
-        if (args.contains("--help")) {
-            std::cout
-                << "geode-finder --seed <int64> --version <1.18..1.21.11|26.1..26.3> --radius <blocks> [--shape circle|square] [--threads 8] [--prefilter-limit 50000] [--output results]\n"
-                << "  --tick-radius 128 --simulation-distance 10 --min-geodes 1 --min-budding 1 --limit 100 --model terrain|stone\n"
-                << "  --prefilter-limit 0: exhaustive player-chunk candidates in the selected model\n"
-                << "  --scan-backend auto|cpu|gpu: optional OpenCL coarse scan for large finite-budget searches\n"
-                << "  --checkpoint-dir <directory>: auto-resume matching unfinished searches (default: output/checkpoints)\n"
-                << "  --no-checkpoint: disable persistent checkpoints; completed exports remove the checkpoint\n"
-                << "  --player-x X --player-z Z: evaluate one position; --geode-chunk-x X --geode-chunk-z Z: geode block coordinates\n"
-                << "  --config finder.properties; --samples file.json: batch model checks; --jsonl: streamed CLI events\n"
-                << "  --desktop: desktop protocol v3 (ranking rule primary-desc-distance-asc-x-asc-z-asc)\n"
-                << "  Every search writes one leaderboard to CSV, TXT and JSON and reports all three paths in output\n";
+        if (args.contains("--versions")) {
+            std::cout << Json{{"versions", versions()}}.dump() << '\n';
             return 0;
         }
-        std::map<std::string, std::string> config;
-        if (args.contains("--config")) {
-            std::ifstream in(path_utf8(args.at("--config")));
-            if (!in)
-                throw std::runtime_error("Cannot read configuration");
-            std::string line;
-            while (std::getline(in, line)) {
-                line = trim(line);
-                if (line.empty() || line[0] == '#' || line[0] == '!')
-                    continue;
-                auto p = line.find('=');
-                if (p != std::string::npos)
-                    config[trim(line.substr(0, p))] = trim(line.substr(p + 1));
-            }
+        if (args.contains("--help")) {
+            std::cout << "紫水晶母岩独立引擎\n"
+                         "用法: geode-finder --seed 种子 [参数]\n"
+                         "通用: --config finder.json --version 26.3 --radius 10000 --shape circle|square\n"
+                         "      --center-x 0 --center-z 0 --threads 8 --limit 100 --output results\n"
+                         "      --radius-unit blocks|chunks --full-world --no-checkpoint\n"
+                         "统计: --coverage game|circle|square --inner-radius 128 --inner-radius-unit blocks|chunks\n"
+                         "      --simulation-distance 10 --simulation-distance-unit chunks|blocks\n"
+                         "      --min-geodes 1 --min-budding 1 --prefilter-limit 200000 --scan-backend auto|cpu|gpu\n"
+                         "桌面: --desktop (协议v3，stdin/stdout JSONL，不读取CLI配置)\n"
+                         "开发: --model terrain|stone --samples 文件.json；--help只显示入口用法\n"
+                         "配置键为CLI参数名去掉--，命令行覆盖配置；输出目录由--output指定。\n";
+            return 0;
         }
-        auto text = [&](const std::string &flag, const std::string &prop, const std::string &fallback) {
-            if (args.contains(flag))
-                return args.at(flag);
-            if (config.contains(prop))
-                return config.at(prop);
-            return fallback;
+        auto text = [&](const std::string &flag, const std::string &fallback) {
+            auto it = args.find(flag);
+            return it == args.end() ? fallback : it->second;
         };
-        auto number = [&](const std::string &flag, const std::string &prop, int fallback) {
-            return integer(text(flag, prop, std::to_string(fallback)));
+        auto number = [&](const std::string &flag, int fallback) {
+            return integer(text(flag, std::to_string(fallback)));
         };
         Options o;
-        o.seed_text = text("--seed", "seed", "0");
+        o.seed_text = text("--seed", "0");
         o.seed = seed_value(o.seed_text);
-        set_version(o, text("--version", "minecraft-version", "1.21.1"));
+        set_version(o, text("--version", "1.21.1"));
         if (args.contains("--finder") && args.at("--finder") != "geode")
             throw std::invalid_argument("This executable only supports geode");
-        o.radius = number("--radius", "search-radius-blocks", 10000);
-        o.center_x = number("--center-x", "search-center-x", 0);
-        o.center_z = number("--center-z", "search-center-z", 0);
-        o.shape = text("--shape", "search-area-shape", "circle");
-        o.tick_radius = number("--tick-radius", "geode-legacy-random-tick-radius-blocks", 128);
-        o.simulation_distance = number("--simulation-distance", "geode-simulation-distance-chunks", 10);
-        o.threads = number("--threads", "scan-threads", 8);
-        o.min_geodes = number("--min-geodes", "geode-min-geodes", 1);
-        o.min_budding = number("--min-budding", "geode-min-budding-amethyst", 1);
-        o.prefilter = number("--prefilter-limit", "geode-prefilter-limit", 0);
-        o.limit = number("--limit", "geode-result-limit", 100);
-        o.scan_backend = text("--scan-backend", "geode-scan-backend", "auto");
+        o.radius = range_units::text(text("--radius", "10000"),
+                                    text("--radius-unit", "blocks"));
+        o.center_x = number("--center-x", 0);
+        o.center_z = number("--center-z", 0);
+        o.shape = text("--shape", "circle");
+        o.tick_radius = number("--tick-radius", 128);
+        o.coverage = text("--coverage", "game");
+        o.inner_radius = range_units::text(text("--inner-radius", "128"),
+                                          text("--inner-radius-unit", "blocks"));
+        o.simulation_distance = range_units::text(text("--simulation-distance", "10"),
+                                                 text("--simulation-distance-unit", "chunks"), true);
+        o.threads = number("--threads", 8);
+        o.min_geodes = number("--min-geodes", 1);
+        o.min_budding = number("--min-budding", 1);
+        o.prefilter = number("--prefilter-limit", 0);
+        o.limit = number("--limit", 100);
+        o.scan_backend = text("--scan-backend", "auto");
         if (o.scan_backend != "auto" && o.scan_backend != "cpu" && o.scan_backend != "gpu")
             throw std::invalid_argument("Scan backend must be auto, cpu or gpu");
         if (o.scan_backend == "gpu" && !o.prefilter)
             throw std::invalid_argument("GPU coarse scan requires a positive --prefilter-limit");
-        auto model = text("--model", "geode-model", "terrain");
+        auto model = text("--model", "terrain");
         if (model != "stone" && model != "terrain")
             throw std::invalid_argument("Model must be stone or terrain");
         o.terrain = model == "terrain";
-        if (o.radius < 1 || o.radius > 60000000 || std::abs(int64_t(o.center_x)) > 30000000 ||
+        if ((o.coverage != "game" && o.coverage != "circle" && o.coverage != "square") ||
+            o.inner_radius > 60000000 || o.radius < 1 || o.radius > 60000000 || std::abs(int64_t(o.center_x)) > 30000000 ||
             std::abs(int64_t(o.center_z)) > 30000000 || o.threads < 1 || o.threads > 64 || o.tick_radius < 1 ||
             o.tick_radius > 1024 || o.simulation_distance < 2 || o.simulation_distance > 32 || o.prefilter < 0 ||
             o.min_geodes < 1 || o.min_budding < 0 || o.limit < 1 || (o.shape != "circle" && o.shape != "square"))
             throw std::invalid_argument("Invalid search/radius/thread/threshold setting");
-        if (config.contains("full-world") && config.at("full-world") != "false")
-            throw std::invalid_argument("Use an explicit radius; full-world mode is not implemented");
+        if (args.contains("--full-world"))
+            expand_full_world(o);
         if (!args.contains("--no-checkpoint"))
-            o.checkpoint_directory = text("--checkpoint-dir", "geode-checkpoint-directory",
-                                          text("--output", "output-directory", "results") + "/checkpoints");
-        const std::set<std::string> supported = {"--model",
-                                                 "--config",
+            o.checkpoint_directory = text("--checkpoint-dir",
+                                          text("--output", "results") + "/checkpoints");
+        const std::set<std::string> supported = {"--coverage", "--inner-radius", "--inner-radius-unit",
+                                                 "--radius-unit", "--simulation-distance-unit",
+                                                 "--model",
+                                                 "--config", "--full-world",
                                                  "--seed",
                                                  "--finder",
                                                  "--version",
@@ -255,12 +251,14 @@ int run(int argc, char **argv) {
         auto &s = output.stats;
         Json result = {
             {"finder", "geode"},
+            {"cubiomesCommit", CUBIOMES_REVISION},
             {"seed", o.seed_text},
             {"version", o.version},
             {"rankingRuleVersion", kRankingRuleVersion},
             {"rankingRule", kRankingRule},
             {"generationProfile", o.terrain ? "native-density-geode-20002" : "java-modern-stone-20002"},
-            {"activityRule", o.modern ? "simulation-distance-square-java-compatible" : "legacy-chunk-center-circle"},
+            {"activityRule", o.custom() ? "custom-horizontal-" + o.coverage :
+                o.modern ? "simulation-distance-square-java-compatible" : "legacy-chunk-center-circle"},
             {"model", o.terrain ? "terrain-control-estimate" : "stone-estimate"},
             {"verified", false},
             {"searchApproximate", o.prefilter != 0},
@@ -273,6 +271,9 @@ int run(int argc, char **argv) {
               {"shape", o.shape},
               {"tickRadius", o.tick_radius},
               {"simulationDistance", o.simulation_distance},
+              {"coverage", o.coverage},
+              {"innerRadiusBlocks", o.inner_radius},
+              {"effectiveSimulationDistanceChunks", std::min(o.simulation_distance, 31)},
               {"minGeodes", o.min_geodes},
               {"minBudding", o.min_budding},
               {"prefilterLimit", o.prefilter},
@@ -302,7 +303,7 @@ int run(int argc, char **argv) {
         // 在写文件前标记done事件，使文件与标准输出保持一致。
         if (jsonl)
             result["type"] = "done";
-        auto paths = export_results(o, output.centers, text("--output", "output-directory", "results"),
+        auto paths = export_results(o, output.centers, text("--output", "results"),
                                     "results-geode-", result);
         result["output"]["csv"] = paths.csv;
         result["output"]["json"] = paths.json;

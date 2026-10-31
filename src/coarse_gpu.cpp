@@ -218,26 +218,10 @@ bool gpu_scan(const Options &o, int minx, int maxx, int minz, int maxz, const st
     if (group_size < 256 || uint64_t(side) * side * 4 > local_memory)
         return false;
     std::ostringstream code;
-    code << "#define MODERN " << int(o.modern) << "\n#define Q " << q << "\n#define SIDE " << side
+    code << "#define MODERN " << int(o.chunk_constant()) << "\n#define Q " << q << "\n#define SIDE " << side
          << "\n__constant int2 spans[" << 2 * q + 1 << "]={";
     for (int dz = -q; dz <= q; ++dz) {
-        int lo = -q, hi = q;
-        if (!o.modern) {
-            int distance = dz > 0 ? dz * 16 - 7 : dz < 0 ? -dz * 16 - 8 : 0;
-            int64_t remaining = int64_t(o.tick_radius) * o.tick_radius - 1 - int64_t(distance) * distance;
-            if (remaining < 0) {
-                lo = 0;
-                hi = -1;
-            } else {
-                int reach = int(std::sqrt(double(remaining)));
-                while (int64_t(reach + 1) * (reach + 1) <= remaining)
-                    ++reach;
-                while (int64_t(reach) * reach > remaining)
-                    --reach;
-                lo = -((reach + 8) / 16);
-                hi = (reach + 7) / 16;
-            }
-        }
+        auto [lo, hi] = coarse_span(o, dz);
         if (dz != -q)
             code << ',';
         code << "(int2)(" << lo << ',' << hi << ')';

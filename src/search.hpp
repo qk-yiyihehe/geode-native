@@ -12,6 +12,8 @@ constexpr char kRankingRule[] = "primary-desc-distance-asc-x-asc-z-asc";
 struct Options {
     uint64_t seed = 0;
     std::string seed_text = "0", version = "1.21.1", shape = "circle", scan_backend = "auto";
+    std::string coverage = "game";
+    int inner_radius = 128;
     int center_x = 0, center_z = 0, radius = 10000, tick_radius = 128, simulation_distance = 10;
     int min_geodes = 1, min_budding = 1, prefilter = 0, limit = 100, threads = 8;
     bool modern = false, terrain = true, full_world = false;
@@ -23,8 +25,11 @@ struct Options {
     bool contains(int x, int z) const;
     bool intersects_chunk(int cx, int cz) const;
     int activity_radius() const;
+    bool chunk_constant() const { return coverage == "game" && modern; }
+    bool custom() const { return coverage != "game"; }
 };
 
+const std::vector<std::string> &versions();
 void set_version(Options &o, const std::string &version);
 // 全图简写必须先展开，再计算排名距离，
 // 确保实际榜单中心为原点，而不是用户输入但未生效的中心。
@@ -40,6 +45,8 @@ struct Center {
 
 using Weights = std::unordered_map<uint64_t, int>;
 bool active(const Options &o, int player_x, int player_z, int cx, int cz);
+bool active_point(const Options &o, int player_x, int player_z, int x, int z);
+std::pair<int, int> coarse_span(const Options &o, int dz);
 Center optimize(const Options &o, int cx, int cz, const std::vector<Weight> &weights,
                 const std::vector<Weight> &origins = {});
 bool same_hotspot(const Options &o, Center a, Center b);

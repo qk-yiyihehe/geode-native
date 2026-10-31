@@ -2,7 +2,7 @@
 #include "geode.hpp"
 #include "carver.hpp"
 #include "structures.hpp"
-#include "noise263.hpp"
+#include "extensions/java263_noise.hpp"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -144,7 +144,7 @@ struct Normal {
                 auto &b = second[i];
                 auto sample = [&](const Octave &o, double scale) {
                     double f = o.frequency * scale;
-                    return noise263::perlin(o.noise.d, o.noise.a, o.noise.b, o.noise.c, x * f, y * f, z * f);
+                    return cubiomes::java263::perlin(o.noise.d, o.noise.a, o.noise.b, o.noise.c, x * f, y * f, z * f);
                 };
                 value += float(a.weight) * sample(a, 1);
                 value += float(b.weight) * sample(b, 1.0181268882175227);
@@ -205,7 +205,7 @@ struct Blended {
             float value = 0;
             double frequency = 1;
             for (auto &n : octaves) {
-                value += weight * noise263::perlin(n.d, n.a, n.b, n.c, x * frequency, y * frequency, z * frequency,
+                value += weight * cubiomes::java263::perlin(n.d, n.a, n.b, n.c, x * frequency, y * frequency, z * frequency,
                                                    smear * frequency);
                 frequency *= 0.5;
                 weight *= 2;
@@ -215,7 +215,7 @@ struct Blended {
         float mix = std::clamp(sum(main, xx / p[2], yy / p[3], zz / p[2], smear / p[3], 0.05f) + 0.5f, 0.0f, 1.0f);
         float a = mix < 1 ? sum(low, xx, yy, zz, smear, 1.0f / 65536) : 0,
               b = mix > 0 ? sum(high, xx, yy, zz, smear, 1.0f / 65536) : 0;
-        return noise263::lerp(mix, a, b);
+        return cubiomes::java263::lerp(mix, a, b);
     }
 };
 
@@ -565,7 +565,7 @@ struct Terrain::Impl {
                 break;
             case Op::Lerp: {
                 float t = a();
-                result = t == 0 ? b() : t == 1 ? eval263(n.c, x, y, z) : noise263::lerp(t, b(), eval263(n.c, x, y, z));
+                result = t == 0 ? b() : t == 1 ? eval263(n.c, x, y, z) : cubiomes::java263::lerp(t, b(), eval263(n.c, x, y, z));
                 break;
             }
             case Op::Range: {
@@ -592,10 +592,10 @@ struct Terrain::Impl {
                 float tx = float(x - bx) / sx, ty = float(y - by) / sy, tz = float(z - bz) / sx, corners[2][2];
                 for (int iz = 0; iz < 2; ++iz)
                     for (int iy = 0; iy < 2; ++iy)
-                        corners[iz][iy] = noise263::lerp(tx, eval263(n.a, bx, by + iy * sy, bz + iz * sx),
+                        corners[iz][iy] = cubiomes::java263::lerp(tx, eval263(n.a, bx, by + iy * sy, bz + iz * sx),
                                                          eval263(n.a, bx + sx, by + iy * sy, bz + iz * sx));
-                result = noise263::lerp(tz, noise263::lerp(ty, corners[0][0], corners[0][1]),
-                                        noise263::lerp(ty, corners[1][0], corners[1][1]));
+                result = cubiomes::java263::lerp(tz, cubiomes::java263::lerp(ty, corners[0][0], corners[0][1]),
+                                        cubiomes::java263::lerp(ty, corners[1][0], corners[1][1]));
                 break;
             }
             case Op::Spline: {
@@ -616,7 +616,7 @@ struct Terrain::Impl {
                           t = (input - begin[index].location) / span, v0 = value(index), v1 = value(index + 1),
                           delta = v1 - v0;
                     float d0 = begin[index].derivative * span - delta, d1 = -begin[index + 1].derivative * span + delta;
-                    result = noise263::lerp(t, v0, v1) + t * (1 - t) * noise263::lerp(t, d0, d1);
+                    result = cubiomes::java263::lerp(t, v0, v1) + t * (1 - t) * cubiomes::java263::lerp(t, d0, d1);
                 }
                 break;
             }

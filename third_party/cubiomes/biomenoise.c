@@ -5,6 +5,10 @@
 #include "tables/btree19.h"
 #include "tables/btree20.h"
 #include "tables/btree21wd.h"
+#include "tables/btree215.h"
+#include "tables/btree262.h"
+#include "tables/btree263.h"
+#include "tables/spline263.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -468,7 +472,7 @@ int mapEndBiome(const EndNoise *en, int *out, int x, int z, int w, int h)
             {
                 hx = 2*hx + 1;
                 hz = 2*hz + 1;
-                if (en->mc > MC_1_13)
+                if (en->mc > MC_1_13 && en->mc < MC_26_3)
                 {   // add outer end rings
                     rsq = hx * hx + hz * hz;
                     if ((int)rsq < 0)
@@ -582,7 +586,7 @@ void sampleNoiseColumnEnd(double column[],
     };
 
     int y;
-    if (en->mc > MC_1_13)
+    if (en->mc > MC_1_13 && en->mc < MC_26_3)
     {   // add outer end rings
         uint64_t rsq = (uint64_t) x * x + (uint64_t) z * z;
         if ((int)rsq < 0)
@@ -807,7 +811,7 @@ int genEndScaled(const EndNoise *en, int *out, Range r, int mc, uint64_t sha)
                     out[j*r.sx+i] = the_end;
                     continue;
                 }
-                else if (mc > MC_1_13 && (int)(rsq) < 0)
+                else if (mc > MC_1_13 && mc < MC_26_3 && (int)(rsq) < 0)
                 {
                     out[j*r.sx+i] = end_barrens;
                     continue;
@@ -940,10 +944,7 @@ void setBetaBiomeSeed(BiomeNoiseBeta *bnb, uint64_t seed)
     bnb->nptype = -1;
 }
 
-
-enum { SP_CONTINENTALNESS, SP_EROSION, SP_RIDGES, SP_WEIRDNESS };
-
-static void addSplineVal(Spline *rsp, float loc, Spline *val, float der)
+void addSplineVal(Spline *rsp, float loc, Spline *val, float der)
 {
     rsp->loc[rsp->len] = loc;
     rsp->val[rsp->len] = val;
@@ -955,7 +956,7 @@ static void addSplineVal(Spline *rsp, float loc, Spline *val, float der)
     //}
 }
 
-static Spline *createFixSpline(SplineStack *ss, float val)
+Spline *createFixSpline(SplineStack *ss, float val)
 {
     FixSpline *sp = &ss->fstack[ss->flen++];
     sp->len = 1;
@@ -1071,6 +1072,10 @@ static Spline *createLandSpline(
     return sp;
 }
 
+static inline float peaksAndValleys(float weirdness) {
+    return -(fabsf(fabsf(weirdness) - 0.6666667F) - 0.33333334F) * 3.0F;
+}
+
 float getSpline(const Spline *sp, const float *vals)
 {
     if (!sp || sp->len <= 0 || sp->len >= 12)
@@ -1111,6 +1116,13 @@ float getSpline(const Spline *sp, const float *vals)
 
 void initBiomeNoise(BiomeNoise *bn, int mc)
 {
+    if (mc >= MC_26_3)
+    {
+        // 使用原版已序列化系数，避免旧版公式重建样条时的舍入差异。
+        bn->sp = CLIMATE263_SPLINE_ROOT;
+        bn->mc = mc;
+        return;
+    }
     SplineStack *ss = &bn->ss;
     memset(ss, 0, sizeof(*ss));
     Spline *sp = &ss->stack[ss->len++];
@@ -1137,57 +1149,130 @@ void initBiomeNoise(BiomeNoise *bn, int mc)
 }
 
 
-/// Biome sampler for MC 1.18
+static inline float lerpClimate(float t, float a, float b)
+{
+    return a + t * (b - a);
+}
+
+static float getSplineFloat(const Spline *sp, const float *values)
+{
+    if (sp->len == 1)
+        return ((const FixSpline*)sp)->val;
+    float x = values[sp->typ];
+    int i = 0;
+    while (i < sp->len && x >= sp->loc[i])
+        i++;
+    if (i == 0 || i == sp->len)
+    {
+        if (i) i--;
+        return getSplineFloat(sp->val[i], values) + sp->der[i] * (x - sp->loc[i]);
+    }
+    float span = sp->loc[i] - sp->loc[i-1];
+    float t = (x - sp->loc[i-1]) / span;
+    float a = getSplineFloat(sp->val[i-1], values);
+    float b = getSplineFloat(sp->val[i], values);
+    float delta = b - a;
+    float da = sp->der[i-1] * span - delta;
+    float db = -sp->der[i] * span + delta;
+    return lerpClimate(t, a, b) + t * (1.0F-t) * lerpClimate(t, da, db);
+}
+
+float sampleClimateNoise(const BiomeNoise *bn, int parameter, double x, double y, double z)
+{
+    const DoublePerlinNoise *noise = bn->climate + parameter;
+    return bn->mc >= MC_26_3 ? sampleDoublePerlinFloat(noise, x, y, z) :
+                              (float)sampleDoublePerlin(noise, x, y, z);
+}
+
+float sampleClimateDepth(const BiomeNoise *bn, float c, float e, float w, int blockY)
+{
+    float inputs[] = {c, e, peaksAndValleys(w), w};
+    if (bn->mc >= MC_26_3)
+    {
+        int cy = blockY < -64 ? -64 : blockY > 320 ? 320 : blockY;
+        float gradient = 1.5F + (float)(cy+64) * (-3.0F/384.0F);
+        return gradient + (-0.50375F + getSplineFloat(bn->sp, inputs));
+    }
+    double off = getSpline(bn->sp, inputs) + 0.015F;
+    return (float)(1.0 - blockY / 128.0 - 83.0/160.0 + off);
+}
+
+void sampleBiomeClimate(const BiomeNoise *bn, float values[NP_MAX], int x, int y, int z,
+    uint32_t flags)
+{
+    double px = x * 0.25, pz = z * 0.25;
+    if (!(flags & SAMPLE_NO_SHIFT))
+    {
+        if (bn->mc >= MC_26_3)
+        {
+            px += sampleClimateNoise(bn, NP_SHIFT, x*0.25, 0, z*0.25) * 4.0F;
+            pz += sampleClimateNoise(bn, NP_SHIFT, z*0.25, x*0.25, 0) * 4.0F;
+        }
+        else
+        {
+            px += sampleDoublePerlin(&bn->climate[NP_SHIFT], x*0.25, 0, z*0.25) * 4.0;
+            pz += sampleDoublePerlin(&bn->climate[NP_SHIFT], z*0.25, x*0.25, 0) * 4.0;
+        }
+    }
+    float c = sampleClimateNoise(bn, NP_CONTINENTALNESS, px, 0, pz);
+    float e = sampleClimateNoise(bn, NP_EROSION, px, 0, pz);
+    float w = sampleClimateNoise(bn, NP_WEIRDNESS, px, 0, pz);
+    float d = flags & SAMPLE_NO_DEPTH ? 0 : sampleClimateDepth(bn, c, e, w, y);
+    values[NP_TEMPERATURE] = flags & SAMPLE_NO_TEMPERATURE ? 0 :
+        sampleClimateNoise(bn, NP_TEMPERATURE, px, 0, pz);
+    values[NP_HUMIDITY] = flags & SAMPLE_NO_HUMIDITY ? 0 :
+        sampleClimateNoise(bn, NP_HUMIDITY, px, 0, pz);
+    values[NP_CONTINENTALNESS] = c;
+    values[NP_EROSION] = e;
+    values[NP_DEPTH] = d;
+    values[NP_WEIRDNESS] = w;
+}
+
 int sampleBiomeNoise(const BiomeNoise *bn, int64_t *np, int x, int y, int z,
     uint64_t *dat, uint32_t sample_flags)
 {
     if (bn->nptype >= 0)
-    {   // initialized for a specific climate parameter
+    {
         if (np)
             memset(np, 0, NP_MAX*sizeof(*np));
-        int64_t id = (int64_t) (10000.0 * sampleClimatePara(bn, np, x, z));
-        return (int) id;
+        double value = sampleClimatePara(bn, np, x, z);
+        return bn->mc >= MC_26_3 ? (int)(int64_t)(10000.0F * (float)value) :
+                                  (int)(int64_t)(10000.0 * value);
     }
+    float values[NP_MAX];
+    sampleBiomeClimate(bn, values, x*4, y*4, z*4, sample_flags);
+    int64_t local[NP_MAX];
+    int64_t *quantized = np ? np : local;
+    for (int i = 0; i < NP_MAX; i++)
+        quantized[i] = (int64_t)(10000.0F * values[i]);
+    if (sample_flags & SAMPLE_NO_BIOME)
+        return none;
+    return climateToBiome(bn->mc, (const uint64_t*)quantized, dat);
+}
 
-    float t = 0, h = 0, c = 0, e = 0, d = 0, w = 0;
-    double px = x, pz = z;
-    if (!(sample_flags & SAMPLE_NO_SHIFT))
+void sampleNoiseParameters(BiomeNoise *bn, int x, int z, float np_param[4]) {
+    if (bn->mc >= MC_26_3)
     {
-        px += sampleDoublePerlin(&bn->climate[NP_SHIFT], x, 0, z) * 4.0;
-        pz += sampleDoublePerlin(&bn->climate[NP_SHIFT], z, x, 0) * 4.0;
+        float values[NP_MAX];
+        sampleBiomeClimate(bn, values, x*4, 0, z*4,
+            SAMPLE_NO_DEPTH | SAMPLE_NO_TEMPERATURE | SAMPLE_NO_HUMIDITY);
+        np_param[0] = values[NP_CONTINENTALNESS];
+        np_param[1] = values[NP_EROSION];
+        np_param[2] = peaksAndValleys(values[NP_WEIRDNESS]);
+        np_param[3] = values[NP_WEIRDNESS];
+        return;
     }
+    double px = x + sampleDoublePerlin(&bn->climate[NP_SHIFT], x, 0, z) * 4.0;
+    double pz = z + sampleDoublePerlin(&bn->climate[NP_SHIFT], z, x, 0) * 4.0;
 
-    c = sampleDoublePerlin(&bn->climate[NP_CONTINENTALNESS], px, 0, pz);
-    e = sampleDoublePerlin(&bn->climate[NP_EROSION], px, 0, pz);
-    w = sampleDoublePerlin(&bn->climate[NP_WEIRDNESS], px, 0, pz);
+    float c = (float)sampleDoublePerlin(&bn->climate[NP_CONTINENTALNESS], px, 0, pz);
+    float e = (float)sampleDoublePerlin(&bn->climate[NP_EROSION], px, 0, pz);
+    float w = (float)sampleDoublePerlin(&bn->climate[NP_WEIRDNESS], px, 0, pz);
 
-    if (!(sample_flags & SAMPLE_NO_DEPTH))
-    {
-        float np_param[] = {
-            c, e, -3.0F * ( fabsf( fabsf(w) - 0.6666667F ) - 0.33333334F ), w,
-        };
-        double off = getSpline(bn->sp, np_param) + 0.015F;
-
-        //double py = y + sampleDoublePerlin(&bn->shift, y, z, x) * 4.0;
-        d = 1.0 - (y * 4) / 128.0 - 83.0/160.0 + off;
-    }
-
-    t = sampleDoublePerlin(&bn->climate[NP_TEMPERATURE], px, 0, pz);
-    h = sampleDoublePerlin(&bn->climate[NP_HUMIDITY], px, 0, pz);
-
-    int64_t l_np[6];
-    int64_t *p_np = np ? np : l_np;
-    p_np[0] = (int64_t)(10000.0F*t);
-    p_np[1] = (int64_t)(10000.0F*h);
-    p_np[2] = (int64_t)(10000.0F*c);
-    p_np[3] = (int64_t)(10000.0F*e);
-    p_np[4] = (int64_t)(10000.0F*d);
-    p_np[5] = (int64_t)(10000.0F*w);
-
-    int id = none;
-    if (!(sample_flags & SAMPLE_NO_BIOME))
-        id = climateToBiome(bn->mc, (const uint64_t*)p_np, dat);
-    return id;
+    np_param[0] = c;
+    np_param[1] = e;
+    np_param[2] = peaksAndValleys(w);
+    np_param[3] = w;
 }
 
 // Note: Climate noise is sampled at a 1:1 scale.
@@ -1225,7 +1310,7 @@ int sampleBiomeNoiseBeta(const BiomeNoiseBeta *bnb, int64_t *np, double *nv,
 
 int getOldBetaBiome(float t, float h)
 {
-    static const uint8_t biome_table_beta_1_7[64*64] = 
+    static const uint8_t biome_table_beta_1_7[64*64] =
     {
         5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,
         6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,1,1,1,1,
@@ -1453,11 +1538,28 @@ int climateToBiome(int mc, const uint64_t np[6], uint64_t *dat)
         btree21wd_steps, &btree21wd_param[0][0], btree21wd_nodes, btree21wd_order,
         sizeof(btree21wd_nodes) / sizeof(uint64_t)
     };
+    static const BiomeTree btree215 = {
+        btree215_steps, &btree215_param[0][0], btree215_nodes, btree215_order,
+        sizeof(btree215_nodes) / sizeof(uint64_t)
+    };
+    static const BiomeTree btree262 = {
+        btree262_steps, &btree262_param[0][0], btree262_nodes, btree262_order,
+        sizeof(btree262_nodes) / sizeof(uint64_t)
+    };
+    static const BiomeTree btree263 = {
+        btree263_steps, &btree263_param[0][0], btree263_nodes, btree263_order,
+        sizeof(btree263_nodes) / sizeof(uint64_t)
+    };
 
     const BiomeTree *bt;
     int idx;
-
-    if (mc >= MC_1_21_WD)
+    if (mc >= MC_26_3)
+        bt = &btree263;
+    else if (mc >= MC_26_2)
+        bt = &btree262;
+    else if (mc >= MC_1_21_5)
+        bt = &btree215;
+    else if (mc >= MC_1_21_4)
         bt = &btree21wd;
     else if (mc >= MC_1_20_6)
         bt = &btree20;
@@ -1468,7 +1570,8 @@ int climateToBiome(int mc, const uint64_t np[6], uint64_t *dat)
     else
         bt = &btree18;
 
-    if (dat)
+    // 0是调用方的空缓存标记；根节点不是可用的群系叶，不能用其包围盒距离剪枝。
+    if (dat && *dat != 0)
     {
         int alt = (int) *dat;
         uint64_t ds = get_np_dist(np, bt, alt);
@@ -1478,6 +1581,8 @@ int climateToBiome(int mc, const uint64_t np[6], uint64_t *dat)
     else
     {
         idx = get_resulting_node(np, bt, 0, 0, -1, 0);
+        if (dat)
+            *dat = (uint64_t) idx;
     }
 
     return (bt->nodes[idx] >> 48) & 0xFF;
@@ -1509,6 +1614,28 @@ void setClimateParaSeed(BiomeNoise *bn, uint64_t seed, int large, int nptype, in
 
 double sampleClimatePara(const BiomeNoise *bn, int64_t *np, double x, double z)
 {
+    if (bn->mc >= MC_26_3)
+    {
+        float p;
+        if (bn->nptype == NP_DEPTH)
+        {
+            float c = sampleClimateNoise(bn, NP_CONTINENTALNESS, x, 0, z);
+            float e = sampleClimateNoise(bn, NP_EROSION, x, 0, z);
+            float w = sampleClimateNoise(bn, NP_WEIRDNESS, x, 0, z);
+            p = sampleClimateDepth(bn, c, e, w, 0);
+            if (np)
+            {
+                np[NP_CONTINENTALNESS] = (int64_t)(10000.0F*c);
+                np[NP_EROSION] = (int64_t)(10000.0F*e);
+                np[NP_WEIRDNESS] = (int64_t)(10000.0F*w);
+            }
+        }
+        else
+            p = sampleClimateNoise(bn, bn->nptype, x, 0, z);
+        if (np)
+            np[bn->nptype] = (int64_t)(10000.0F*p);
+        return p;
+    }
     if (bn->nptype == NP_DEPTH)
     {
         float c, e, w;
@@ -1517,7 +1644,7 @@ double sampleClimatePara(const BiomeNoise *bn, int64_t *np, double x, double z)
         w = sampleDoublePerlin(bn->climate + NP_WEIRDNESS, x, 0, z);
 
         float np_param[] = {
-            c, e, -3.0F * ( fabsf( fabsf(w) - 0.6666667F ) - 0.33333334F ), w,
+            c, e, peaksAndValleys(w), w,
         };
         double off = getSpline(bn->sp, np_param) + 0.015F;
         int y = 0;
@@ -1972,4 +2099,115 @@ Range getVoronoiSrcRange(Range r)
     return s;
 }
 
+void initBlendedNoise(BlendedNoise *bn, uint64_t ws, int dim)
+{
+    static const int jhash_terrain = 0x62d03a68; // minecraft:terrain
+    static const uint64_t md5_terrain[2] = {0x1ee555222ef96f14, 0xe2bedfdbebe43d33}; // minecraft:terrain
 
+    switch (dim) {
+    case DIM_OVERWORLD:
+        bn->xzScale = 0.25;
+        bn->yScale = 0.125;
+        bn->xzFactor = 80.0;
+        bn->yFactor = 160.0;
+        bn->smearScaleMultiplier = 8.0;
+        break;
+    case DIM_NETHER:
+        bn->xzScale = 0.25;
+        bn->yScale = 0.375;
+        bn->xzFactor = 80.0;
+        bn->yFactor = 60.0;
+        bn->smearScaleMultiplier = 8.0;
+        break;
+    case DIM_END:
+        bn->xzScale = 0.25;
+        bn->yScale = 0.25;
+        bn->xzFactor = 80.0;
+        bn->yFactor = 160.0;
+        bn->smearScaleMultiplier = 4.0;
+        break;
+    default: UNREACHABLE();
+    }
+    bn->xzMultiplier = 684.412 * bn->xzScale;
+    bn->yMultiplier = 684.412 * bn->yScale;
+    bn->smearedYScale = bn->yMultiplier * bn->smearScaleMultiplier;
+    bn->factoredSmearedYScale = bn->smearedYScale / bn->yFactor;
+
+    switch (dim) {
+    case DIM_OVERWORLD: {
+        Xoroshiro wsx;
+        xSetSeed(&wsx, ws);
+        const uint64_t lo = xNextLong(&wsx);
+        const uint64_t hi = xNextLong(&wsx);
+
+        Xoroshiro xr = {lo ^ md5_terrain[0], hi ^ md5_terrain[1]};
+        xOctaveLegacyInit(&bn->octmin, &xr, bn->oct+0, -15, 16);
+        xOctaveLegacyInit(&bn->octmax, &xr, bn->oct+16, -15, 16);
+        xOctaveLegacyInit(&bn->octmain, &xr, bn->oct+32, -7, 8);
+        break;
+    }
+    case DIM_NETHER: {
+        uint64_t wsj;
+        setSeed(&wsj, ws);
+        octaveInit(&bn->octmin, &wsj, bn->oct+0, -15, 16);
+        octaveInit(&bn->octmax, &wsj, bn->oct+16, -15, 16);
+        octaveInit(&bn->octmain, &wsj, bn->oct+32, -7, 8);
+        break;
+    }
+    case DIM_END: {
+        uint64_t wsr;
+        setSeed(&wsr, ws);
+        const uint64_t nl = nextLong(&wsr);
+
+        uint64_t rnd;
+        setSeed(&rnd, jhash_terrain ^ nl);
+        octaveInit(&bn->octmin, &rnd, bn->oct+0, -15, 16);
+        octaveInit(&bn->octmax, &rnd, bn->oct+16, -15, 16);
+        octaveInit(&bn->octmain, &rnd, bn->oct+32, -7, 8);
+        break;
+    }
+    default: UNREACHABLE();
+    }
+}
+
+double sampleBase3dNoise(BlendedNoise *bn, int x, int y, int z)
+{
+    const double scaledX = x * bn->xzMultiplier;
+    const double scaledY = y * bn->yMultiplier;
+    const double scaledZ = z * bn->xzMultiplier;
+    const double factoredX = scaledX / bn->xzFactor;
+    const double factoredY = scaledY / bn->yFactor;
+    const double factoredZ = scaledZ / bn->xzFactor;
+
+    double minSampleTotal = 0.0;
+    double maxSampleTotal = 0.0;
+    double mainSampleTotal = 0.0;
+    double o = 1.0;
+
+    for (int octaveIdx = 0; octaveIdx < 8; octaveIdx++) {
+        mainSampleTotal += samplePerlin(&bn->octmain.octaves[octaveIdx], maintainPrecision(factoredX * o), maintainPrecision(factoredY * o), maintainPrecision(factoredZ * o), bn->factoredSmearedYScale * o, factoredY * o) / o;
+        o /= 2.0;
+    }
+
+    double q = (mainSampleTotal / 10.0 + 1.0) / 2.0;
+    o = 1.0;
+
+    for (int octaveIdx = 0; octaveIdx < 16; octaveIdx++) {
+        double sampleY = maintainPrecision(scaledY * o);
+        double sampleX = maintainPrecision(scaledX * o);
+        double sampleZ = maintainPrecision(scaledZ * o);
+        double yamp = bn->smearedYScale * o;
+        double ymax = scaledY * o;
+        if (q < 1.0) {
+            minSampleTotal += samplePerlin(&bn->octmin.octaves[octaveIdx], sampleX, sampleY, sampleZ, yamp, ymax) / o;
+        }
+
+        if (q > 0.0) {
+            maxSampleTotal += samplePerlin(&bn->octmax.octaves[octaveIdx], sampleX, sampleY, sampleZ, yamp, ymax) / o;
+        }
+
+        o /= 2.0;
+    }
+
+    return clampedLerp(q, minSampleTotal / 512.0, maxSampleTotal / 512.0) / 128.0;
+}

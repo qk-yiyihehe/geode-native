@@ -22,7 +22,7 @@ STRUCT(Range)
     //
     // Volumes generated with a range are generally indexed as:
     //  out [ i_y*sx*sz + i_z*sx + i_x ]
-    // where i_x, i_y, i_z are indecies in their respective directions.
+    // where i_x, i_y, i_z are indices in their respective directions.
     //
     // EXAMPLES
     // Area at normal biome scale (1:4):
@@ -154,6 +154,21 @@ STRUCT(BiomeTree)
     uint32_t len;
 };
 
+STRUCT(BlendedNoise)
+{
+    double xzScale, yScale;
+    double xzFactor, yFactor;
+    double xzMultiplier, yMultiplier;
+    double smearScaleMultiplier;
+    double smearedYScale;
+    double factoredSmearedYScale;
+    OctaveNoise octmin;
+    OctaveNoise octmax;
+    OctaveNoise octmain;
+    PerlinNoise oct[16+16+8];
+};
+
+
 #ifdef __cplusplus
 extern "C"
 {
@@ -215,6 +230,17 @@ int genNetherScaled(const NetherNoise *nn, int *out, Range r, int mc, uint64_t s
 void setEndSeed(EndNoise *en, int mc, uint64_t seed);
 int mapEndBiome(const EndNoise *en, int *out, int x, int z, int w, int h);
 int mapEnd(const EndNoise *en, int *out, int x, int z, int w, int h);
+/* Given bordering noise columns and a fractional position between those,
+ * determine the surface block height (i.e. where the interpolated noise > 0).
+ * Note that the noise columns should be of size: ncolxz[ colheight+1 ]
+ */
+int getSurfaceHeight(
+        const double ncol00[], const double ncol01[],
+        const double ncol10[], const double ncol11[],
+        int colymin, int colymax, int blockspercell, double dx, double dz);
+
+void sampleNoiseColumnEnd(double column[], const SurfaceNoise *sn,
+        const EndNoise *en, int x, int z, int colymin, int colymax);
 int getEndSurfaceHeight(int mc, uint64_t seed, int x, int z);
 int mapEndSurfaceHeight(float *y, const EndNoise *en, const SurfaceNoise *sn,
     int x, int z, int w, int h, int scale, int ymin);
@@ -240,12 +266,27 @@ enum {
     SAMPLE_NO_SHIFT = 0x1,  // skip local distortions
     SAMPLE_NO_DEPTH = 0x2,  // skip depth sampling for vertical biomes
     SAMPLE_NO_BIOME = 0x4,  // do not apply climate noise to biome mapping
+    SAMPLE_NO_TEMPERATURE = 0x8, // 跳过的分量在原始气候输出中为0
+    SAMPLE_NO_HUMIDITY = 0x10,
 };
+enum { SP_CONTINENTALNESS, SP_EROSION, SP_RIDGES, SP_WEIRDNESS };
+void addSplineVal(Spline *rsp, float loc, Spline *val, float der);
+Spline *createFixSpline(SplineStack *ss, float val);
+float getSpline(const Spline *sp, const float *vals);
 void initBiomeNoise(BiomeNoise *bn, int mc);
 void setBiomeSeed(BiomeNoise *bn, uint64_t seed, int large);
 void setBetaBiomeSeed(BiomeNoiseBeta *bnb, uint64_t seed);
 int sampleBiomeNoise(const BiomeNoise *bn, int64_t *np, int x, int y, int z,
     uint64_t *dat, uint32_t sample_flags);
+// 原始六气候分量，NP_*顺序；输入为方块坐标，不做群系量化或Voronoi。
+// 调用前需setBiomeSeed完整初始化；flags可跳过不需要的分量。
+void sampleBiomeClimate(const BiomeNoise *bn, float values[NP_MAX], int x, int y, int z,
+    uint32_t sample_flags);
+// 输入沿用底层噪声坐标；按版本分派double或float噪声栈。
+float sampleClimateNoise(const BiomeNoise *bn, int parameter, double x, double y, double z);
+// 已有气候分量到深度；blockY为方块高度，与完整采样器使用同一版本规则。
+float sampleClimateDepth(const BiomeNoise *bn, float c, float e, float w, int blockY);
+void sampleNoiseParameters(BiomeNoise *bn, int x, int z, float np_param[4]);
 int sampleBiomeNoiseBeta(const BiomeNoiseBeta *bnb, int64_t *np, double *nv,
     int x, int z);
 double approxSurfaceBeta(const BiomeNoiseBeta *bnb, const SurfaceNoiseBeta *snb,
@@ -305,6 +346,25 @@ int getBiomeDepthAndScale(int id, double *depth, double *scale, int *grass);
 // Gets the range in the parent/source layer which may be accessed by voronoi.
 Range getVoronoiSrcRange(Range r);
 
+/**
+ * Initialise a blended noise instance.
+ *
+ * @param bn the blended noise instance
+ * @param ws the world seed
+ * @param dim the dimension
+ */
+void initBlendedNoise(BlendedNoise *bn, uint64_t ws, int dim);
+
+/**
+ * Sample `base_3d_noise` using a blended noise instance.
+ *
+ * @param bn the blended noise instance
+ * @param x the world X-coordinate
+ * @param y the world Y-coordinate
+ * @param z the world Z-coordinate
+ * @return the sampled value
+ */
+double sampleBase3dNoise(BlendedNoise *bn, int x, int y, int z);
 
 #ifdef __cplusplus
 }

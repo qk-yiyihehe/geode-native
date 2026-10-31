@@ -1,0 +1,18 @@
+{
+  "seed": "9206294873968313284",
+  "version": "1.21.1",
+  "center-x": 0,
+  "center-z": 0,
+  "radius": 10000,
+  "shape": "circle",
+  "threads": 8,
+  "limit": 100,
+  "output": "results",
+  "coverage": "game",
+  "simulation-distance": 10,
+  "min-geodes": 1,
+  "min-budding": 1,
+  "prefilter-limit": 0,
+  "scan-backend": "auto",
+  "model": "terrain"
+}

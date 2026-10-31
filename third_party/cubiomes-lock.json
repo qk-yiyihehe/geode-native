@@ -1,0 +1,85 @@
+{
+  "repository": "https://github.com/qk-yiyihehe/cubiomes",
+  "commit": "ea575d85536eba8e89a4e2a0528a60d2094221c8",
+  "upstream": "https://github.com/xpple/cubiomes",
+  "upstreamCommit": "aee74239609f3b371747e4573808c04a72518979",
+  "modules": [
+    "Noise",
+    "Biomes",
+    "Java263"
+  ],
+  "patches": [
+    {
+      "file": "tables/btree263.h",
+      "purpose": "依照原版26.3的19分支树重导出，修复同距群系边界的选择差异",
+      "scope": "仅MC_26_3群系树；原版样本与结构起点冻结在tests/java263-reference.tsv"
+    },
+    {
+      "file": "biomenoise.c",
+      "purpose": "保留空缓存修复，并按26.3切换原版float气候、样条与深度顺序",
+      "scope": "旧版本数值路径保留；新增通用原始气候、分量噪声及深度接口"
+    },
+    {
+      "file": "noise.c",
+      "purpose": "保留纵向量化epsilon，并提供原版26.3的float Perlin和交错噪声栈",
+      "scope": "旧samplePerlin/sampleDoublePerlin不改为float；新版接口独立"
+    },
+    {
+      "file": "CMakeLists.txt",
+      "purpose": "独立构建固定-fwrapv与-ffp-contract=off，保留数值语义",
+      "scope": "维护库独立构建；各搜索器保留自身等价编译选项"
+    },
+    {
+      "file": "extensions/java263_noise.hpp",
+      "purpose": "保留原GPL C++接口，Perlin计算统一转调MIT核心",
+      "scope": "可选C++扩展，显式调用；旧版double路径和未接入的群系采样不变",
+      "license": "GPL-3.0-only"
+    },
+    {
+      "file": "cmake/CubiomesModules.cmake",
+      "purpose": "按能力提供静态模块与固定数值编译选项，导出和构建共用模块声明",
+      "scope": "显式模块构建；旧上游全库入口保留"
+    },
+    {
+      "file": "tables/spline263.h",
+      "purpose": "原版26.3群系深度样条系数，避免旧公式重建的舍入差异",
+      "scope": "仅26.3群系气候；不含产品密度图"
+    },
+    {
+      "file": "finders.c",
+      "purpose": "按原版区块内(9,9)检查神殿周围群系，修复边缘误拒绝",
+      "scope": "1.18及之后的神殿准入"
+    }
+  ],
+  "lineEndings": "LF",
+  "files": {
+    ".gitattributes": "4567277c7becb52712424b3ab159863aaf743cf6f5099867e5abf3f0e9a89f05",
+    "CMakeLists.txt": "33754650f8a0d988512b01b656b7eb06cd055d6e50bbb7efa4e2b8596b8311c0",
+    "LICENSE": "894d391566a3bb235b1df6c278960b2083769076b0199a0a367c771b05a74120",
+    "biomenoise.c": "e14c998e14d805af0cfdf2622bf28f37d1aed64ec6f61497b7d85bdcda823091",
+    "biomenoise.h": "e60325706e7b1da124739c53fa18695446e83a5eccf35af6706446846e475b87",
+    "biomes.c": "d1f6f24a978345ababb7306965dd011b213d8e40af00f648f9affa12569c799a",
+    "biomes.h": "eec922d858a6e61b5a112a559cf01c41ed191d63c7af564cb9cac4bd62ebee9e",
+    "cmake/CubiomesModules.cmake": "28254e47d121a0723c2be89a6c18c5180c086cb9a723213508df448713d0c4b1",
+    "cmake/modules.json": "2e2a15f525f79a5e9b9091a324dc012892971e92b89b25b273d70d99249a897f",
+    "extensions/LICENSE": "fb981668c18a279e285fc4d83fba1e836cc84dd4daa73c9697d3cfd2d8aca6e0",
+    "extensions/java263_noise.hpp": "6f0da4d8323acdae034a582b323ce060e01558038364a0e6b4c40c8577bf8f40",
+    "generator.c": "17b1872279c11d2559457e072c0c23ea30c0bd0ddea4ae83b46f85da7ddd3480",
+    "generator.h": "f91395dbe0423a76591a3a885b1ba0cd9cd61db5d04fa2ffe5d9b0e720f9a812",
+    "layers.c": "b7f704e3deec7d0eccaf3d39fe6e8397b28adc49738e210bbaa618a4cb9186b6",
+    "layers.h": "f342f03a736392d93b7f0fd4c17e9021940661c223b0d31cebe6d90882b33c8d",
+    "noise.c": "55c7c40bea729d81e9421218b85e31cfc5a15cbaac23fd76cd9b752cac85e571",
+    "noise.h": "2503c595d723081de43544ffe8d78dcb54ecc9b351c0a93308c64de313428b03",
+    "rng.h": "c0352731200ca95e8f36cf5df827c0178bb38c7c50d2b8b5f34bddf843a50d63",
+    "tables/btree18.h": "c7bbd595cf096f471f88b3f279941b69e4cbb2f320dfdf531f4a6aeaa0095fad",
+    "tables/btree19.h": "a5dc2ad87a80436fc80816dc62060e784d8a4b6a33284e429ae71f46fb11d916",
+    "tables/btree192.h": "9447413e158d57348262faf62d91576973e39d682488f188a1aee8abe369416d",
+    "tables/btree20.h": "8efd25b3165f457d30f9f7fe41f565cba842aa8513038a7e5ed273e481f2aa3b",
+    "tables/btree215.h": "c587f5d7291c3d82b36c6e486e62ac7bb082db8b38a0b5b305060b07f76a86ba",
+    "tables/btree21wd.h": "ce8cc83f9be7e2bd6e61589bfb5c401451ac01c49032f51949ad7de0cfb303d9",
+    "tables/btree262.h": "8d6d91ca150a8f2cda8c45bea6cad0769fedc8e8b1105acade63bf62dda17053",
+    "tables/btree263.h": "6e95ed9a94f1d228828f4c3f479c8158436f927e11e5591b42e061e414743418",
+    "tables/spline263.h": "32afddfc9fd5c8b185213a4b388bfa1a740fd5ade6dfe8e09fa7cb008dc8e4e8",
+    "xrms.h": "33f30460d82a18e52074234786ec1d5a4f8b388352f5d8add500be7db15a0a55"
+  }
+}

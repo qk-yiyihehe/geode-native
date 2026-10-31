@@ -46,7 +46,7 @@ static inline double indexedLerp(uint8_t idx, double a, double b, double c)
 }
 #endif
 
-void perlinInit(PerlinNoise *noise, uint64_t *seed)
+void perlinInit(PerlinNoise *__restrict noise, uint64_t *__restrict seed)
 {
     int i = 0;
     //memset(noise, 0, sizeof(*noise));
@@ -76,7 +76,7 @@ void perlinInit(PerlinNoise *noise, uint64_t *seed)
     noise->t2 = d2*d2*d2 * (d2 * (d2*6.0-15.0) + 10.0);
 }
 
-void xPerlinInit(PerlinNoise *noise, Xoroshiro *xr)
+void xPerlinInit(PerlinNoise *__restrict noise, Xoroshiro *__restrict xr)
 {
     int i = 0;
     //memset(noise, 0, sizeof(*noise));
@@ -107,7 +107,7 @@ void xPerlinInit(PerlinNoise *noise, Xoroshiro *xr)
 }
 
 double samplePerlin(const PerlinNoise *noise, double d1, double d2, double d3,
-        double yamp, double ymin)
+        double yamp, double ymax)
 {
     uint8_t h1, h2, h3;
     double t1, t2, t3;
@@ -143,8 +143,8 @@ double samplePerlin(const PerlinNoise *noise, double d1, double d2, double d3,
 
     if (yamp)
     {
-        /* Match ImprovedNoise's negative-y limit and float epsilon in Java. */
-        double yclamp = ymin >= 0 && ymin < d2 ? ymin : d2;
+        double yclamp = ymax >= 0.0 && ymax < d2 ? ymax : d2;
+        /* Java的纵向量化在floor前加float常量；边界附近不能省略，见本地原版地形回归。 */
         d2 -= floor(yclamp / yamp + 1.0000000116860974E-7) * yamp;
     }
 
@@ -301,6 +301,92 @@ static double simplexGrad(int idx, double x, double y, double z, double d)
     return con * con * indexedLerp(idx, x, y, z);
 }
 
+static inline float gradientFloat(uint8_t index, float a, float b, float c)
+{
+    // 保持原版三项点积顺序；查表避免随机分支和每个角点的double转换。
+    static const float g[16][3] = {
+        {1,1,0}, {-1,1,0}, {1,-1,0}, {-1,-1,0},
+        {1,0,1}, {-1,0,1}, {1,0,-1}, {-1,0,-1},
+        {0,1,1}, {0,-1,1}, {0,1,-1}, {0,-1,-1},
+        {1,1,0}, {0,-1,1}, {-1,1,0}, {0,-1,-1}
+    };
+    const float *v = g[index & 15];
+    return (v[0]*a + v[1]*b) + v[2]*c;
+}
+
+static inline float lerpFloat(float t, float a, float b)
+{
+    return a + t * (b - a);
+}
+
+static inline double wrapFloatNoise(double x)
+{
+    return x - floor(x / 33554432.0 + 0.5) * 33554432.0;
+}
+
+float samplePerlinFloatRaw(const uint8_t permutation[256], double ox, double oy, double oz,
+    double x, double y, double z, double smear)
+{
+    // 26.3坐标与偏移仍为double，格内坐标、梯度和插值逐步舍入为float。
+    double inputY = y;
+    x = wrapFloatNoise(x) + ox;
+    y = wrapFloatNoise(y) + oy;
+    z = wrapFloatNoise(z) + oz;
+    int ix = (int)floor(x), iy = (int)floor(y), iz = (int)floor(z);
+    float dx = (float)(x - ix), dy = (float)(y - iy), dz = (float)(z - iz);
+    float tx = dx*dx*dx * (dx * (dx*6.0F - 15.0F) + 10.0F);
+    float ty = dy*dy*dy * (dy * (dy*6.0F - 15.0F) + 10.0F);
+    float tz = dz*dz*dz * (dz * (dz*6.0F - 15.0F) + 10.0F);
+    if (smear != 0)
+    {
+        double relative = y - iy;
+        double limit = inputY >= 0 && inputY < relative ? inputY : relative;
+        dy = (float)(relative - floor(limit / smear + (double)1.0e-7F) * smear);
+    }
+    float corners[2][2][2];
+    for (int a = 0; a < 2; a++)
+        for (int b = 0; b < 2; b++)
+            for (int c = 0; c < 2; c++)
+            {
+                int h = permutation[(permutation[(permutation[(ix+a)&255]+iy+b)&255]+iz+c)&255];
+                corners[a][b][c] = gradientFloat(h, dx-a, dy-b, dz-c);
+            }
+    return lerpFloat(tz,
+        lerpFloat(ty, lerpFloat(tx, corners[0][0][0], corners[1][0][0]),
+                      lerpFloat(tx, corners[0][1][0], corners[1][1][0])),
+        lerpFloat(ty, lerpFloat(tx, corners[0][0][1], corners[1][0][1]),
+                      lerpFloat(tx, corners[0][1][1], corners[1][1][1])));
+}
+
+float samplePerlinFloat(const PerlinNoise *noise, double x, double y, double z)
+{
+    return samplePerlinFloatRaw(noise->d, noise->a, noise->b, noise->c, x, y, z, 0);
+}
+
+float sampleDoublePerlinFloat(const DoublePerlinNoise *noise, double x, double y, double z)
+{
+    // 原版NoiseStack交错累加两组八度，不能先各组求和再乘总振幅。
+    float value = 0;
+    int count = noise->octA.octcnt > noise->octB.octcnt ? noise->octA.octcnt : noise->octB.octcnt;
+    for (int i = 0; i < count; i++)
+    {
+        if (i < noise->octA.octcnt)
+        {
+            const PerlinNoise *p = noise->octA.octaves + i;
+            float weight = (float)(noise->amplitude * p->amplitude);
+            value += weight * samplePerlinFloat(p, x*p->lacunarity, y*p->lacunarity, z*p->lacunarity);
+        }
+        if (i < noise->octB.octcnt)
+        {
+            const PerlinNoise *p = noise->octB.octaves + i;
+            double f = p->lacunarity * (337.0 / 331.0);
+            float weight = (float)(noise->amplitude * p->amplitude);
+            value += weight * samplePerlinFloat(p, x*f, y*f, z*f);
+        }
+    }
+    return value;
+}
+
 double sampleSimplex2D(const PerlinNoise *noise, double x, double y)
 {
     const double SKEW = 0.5 * (sqrt(3) - 1.0);
@@ -373,6 +459,47 @@ void octaveInit(OctaveNoise *noise, uint64_t *seed, PerlinNoise *octaves,
     noise->octcnt = len;
 }
 
+void xOctaveLegacyInit(OctaveNoise *noise, Xoroshiro *xr, PerlinNoise *octaves, int omin, int len)
+{
+    int i;
+    int end = omin+len-1;
+    double persist = 1.0 / ((1LL << len) - 1.0);
+    double lacuna = pow(2.0, end);
+
+    if (len < 1 || end > 0)
+    {
+        printf("xOctaveLegacyInit(): unsupported octave range\n");
+        return;
+    }
+
+    if (end == 0)
+    {
+        xPerlinInit(&octaves[0], xr);
+        octaves[0].amplitude = persist;
+        octaves[0].lacunarity = lacuna;
+        persist *= 2.0;
+        lacuna *= 0.5;
+        i = 1;
+    }
+    else
+    {
+        xSkipN(xr, -end*262);
+        i = 0;
+    }
+
+    for (; i < len; i++)
+    {
+        xPerlinInit(&octaves[i], xr);
+        octaves[i].amplitude = persist;
+        octaves[i].lacunarity = lacuna;
+        persist *= 2.0;
+        lacuna *= 0.5;
+    }
+
+    noise->octaves = octaves;
+    noise->octcnt = len;
+}
+
 void octaveInitBeta(OctaveNoise *noise, uint64_t *seed, PerlinNoise *octaves,
     int octcnt, double lac, double lacMul, double persist, double persistMul)
 {
@@ -393,6 +520,10 @@ int xOctaveInit(OctaveNoise *noise, Xoroshiro *xr, PerlinNoise *octaves,
         const double *amplitudes, int omin, int len, int nmax)
 {
     static const uint64_t md5_octave_n[][2] = {
+        {0xc613bf766619f992, 0x954753f86691b86a}, // md5 "octave_-16"
+        {0x7eee475a921c6cf5, 0xf2bd39426f8da413}, // md5 "octave_-15"
+        {0xfc0027cef9683114, 0xb758d3954dcbfdd3}, // md5 "octave_-14"
+        {0xd1fc8a05be565eca, 0xdc2a3915cbdda25b}, // md5 "octave_-13"
         {0xb198de63a8012672, 0x7b84cad43ef7b5a8}, // md5 "octave_-12"
         {0x0fd787bfbc403ec3, 0x74a4a31ca21b48b8}, // md5 "octave_-11"
         {0x36d326eed40efeb2, 0x5be9ce18223c636a}, // md5 "octave_-10"
@@ -407,12 +538,13 @@ int xOctaveInit(OctaveNoise *noise, Xoroshiro *xr, PerlinNoise *octaves,
         {0xdffa22b534c5f608, 0xb9b67517d3665ca9}, // md5 "octave_-1"
         {0xd50708086cef4d7c, 0x6e1651ecc7f43309}, // md5 "octave_0"
     };
-    static const double lacuna_ini[] = { // -omin = 3..12
+    static const double lacuna_ini[] = { // -omin = 3..16
         1, .5, .25, 1./8, 1./16, 1./32, 1./64, 1./128, 1./256, 1./512, 1./1024,
-        1./2048, 1./4096,
+        1./2048, 1./4096, 1./8192, 1./16384, 1./32768, 1./65536
     };
-    static const double persist_ini[] = { // len = 4..9
-        0, 1, 2./3, 4./7, 8./15, 16./31, 32./63, 64./127, 128./255, 256./511,
+    static const double persist_ini[] = { // len = 4..16
+        0, 1, 2./3, 4./7, 8./15, 16./31, 32./63, 64./127, 128./255, 256./511, 512./1023,
+        1024./2047, 2048./4095, 4096./8191, 8192./16383, 16384./32767, 32768./65535
     };
 #if DEBUG
     if (-omin < 0 || -omin >= (int) (sizeof(lacuna_ini)/sizeof(double)) ||
@@ -433,8 +565,8 @@ int xOctaveInit(OctaveNoise *noise, Xoroshiro *xr, PerlinNoise *octaves,
         if (amplitudes[i] == 0)
             continue;
         Xoroshiro pxr;
-        pxr.lo = xlo ^ md5_octave_n[12 + omin + i][0];
-        pxr.hi = xhi ^ md5_octave_n[12 + omin + i][1];
+        pxr.lo = xlo ^ md5_octave_n[16 + omin + i][0];
+        pxr.hi = xhi ^ md5_octave_n[16 + omin + i][1];
         xPerlinInit(&octaves[n], &pxr);
         octaves[n].amplitude = amplitudes[i] * persist;
         octaves[n].lacunarity = lacuna;
@@ -553,8 +685,9 @@ int xDoublePerlinInit(DoublePerlinNoise *noise, Xoroshiro *xr,
         len--;
     for (i = 0; amplitudes[i] == 0.0; i++)
         len--;
-    static const double amp_ini[] = { // (5 ./ 3) * len / (len + 1), len = 2..9
+    static const double amp_ini[] = { // (5 ./ 3) * len / (len + 1), len = 2..16
         0, 5./6, 10./9, 15./12, 20./15, 25./18, 30./21, 35./24, 40./27, 45./30,
+        50./33, 55./36, 60./39, 65./42, 70./45, 75./48, 80./51
     };
     noise->amplitude = amp_ini[len];
     return n;

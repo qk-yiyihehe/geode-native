@@ -1,6 +1,6 @@
 #include "geode.hpp"
 #include "terrain.hpp"
-#include "noise263.hpp"
+#include "extensions/java263_noise.hpp"
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -225,7 +225,7 @@ struct Field {
 
     double sample263(int x, int y, int z) const {
         auto sample = [&](const Noise &n, double scale) {
-            return noise263::perlin(n.permutation.data(), n.dx, n.dy, n.dz, x * scale / 16.0, y * scale / 16.0,
+            return cubiomes::java263::perlin(n.permutation.data(), n.dx, n.dy, n.dz, x * scale / 16.0, y * scale / 16.0,
                                     z * scale / 16.0);
         };
         float a = float(5.0 / 6.0) * sample(first, 1), b = float(5.0 / 6.0) * sample(second, 1.0181268882175227);

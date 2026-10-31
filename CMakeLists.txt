@@ -1,52 +1,67 @@
 cmake_minimum_required(VERSION 3.20)
 project(geode_native LANGUAGES C CXX)
+set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-add_library(terrain_noise third_party/cubiomes/noise.c)
-target_include_directories(terrain_noise PUBLIC third_party/cubiomes)
-add_library(
-    terrain_biomes src/structure_layout/biome_bridge.c third_party/cubiomes/generator.c
-                   third_party/cubiomes/biomenoise.c third_party/cubiomes/biomes.c third_party/cubiomes/layers.c)
-target_link_libraries(terrain_biomes PUBLIC terrain_noise)
-add_library(
-    geode_core
-    src/geode.cpp
-    src/search.cpp
-    src/checkpoint.cpp
-    src/coarse_gpu.cpp
-    src/terrain.cpp
-    src/carver.cpp
-    src/structures.cpp
-    src/structure_layout/layout.cpp
-    src/structure_layout/climate263.cpp)
-target_include_directories(
-    geode_core
-    PUBLIC src
-    PRIVATE data src/structure_layout)
-target_link_libraries(geode_core PUBLIC terrain_biomes)
-add_executable(geode-finder src/main.cpp src/protocol.cpp)
-target_include_directories(geode-finder PRIVATE third_party)
-target_link_libraries(geode-finder PRIVATE geode_core)
-if(MSVC)
-    set_property(TARGET terrain_noise terrain_biomes geode_core geode-finder
-                 PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-    target_compile_options(terrain_noise PRIVATE /O2 /fp:strict)
-    target_compile_options(terrain_biomes PRIVATE /O2 /fp:strict)
-    target_compile_options(geode_core PRIVATE /O2 /fp:strict /utf-8)
-    target_compile_options(geode-finder PRIVATE /utf-8)
-else()
-    target_compile_options(terrain_noise PRIVATE -O3 -fwrapv -ffp-contract=off)
-    target_compile_options(terrain_biomes PRIVATE -O3 -fwrapv -ffp-contract=off)
-    target_compile_options(geode_core PRIVATE -O3 -Wall -Wextra -ffp-contract=off)
-    target_link_options(geode-finder PRIVATE -static -static-libgcc -static-libstdc++ -s)
+find_package(Threads REQUIRED)
+
+set(standalone OFF)
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+    set(standalone ON)
+endif()
+option(GEODE_BUILD_CLI "构建独立命令行与桌面协议程序" ${standalone})
+option(GEODE_ENABLE_IPO "发布构建启用跨文件链接优化" ${GEODE_BUILD_CLI})
+if(GEODE_ENABLE_IPO)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT ipo_available OUTPUT ipo_reason)
+    if(ipo_available)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+    else()
+        message(STATUS "链接优化不可用，保留普通优化：${ipo_reason}")
+    endif()
+endif()
+
+include(third_party/cubiomes/cmake/CubiomesModules.cmake)
+cubiomes_add_modules(ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cubiomes"
+    PREFIX GeodeCubiomes LOCK "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cubiomes-lock.json"
+    MODULES Biomes Java263)
+
+add_library(terrain_biomes STATIC src/structure_layout/biome_bridge.c)
+target_link_libraries(terrain_biomes PUBLIC GeodeCubiomes::Biomes)
+add_library(geode_core STATIC
+    src/geode.cpp src/search.cpp src/checkpoint.cpp src/coarse_gpu.cpp
+    src/terrain.cpp src/carver.cpp src/structures.cpp
+    src/structure_layout/layout.cpp src/structure_layout/climate263.cpp)
+add_library(MinecraftFinders::Geode ALIAS geode_core)
+target_include_directories(geode_core PUBLIC include src PRIVATE data src/structure_layout)
+target_compile_features(geode_core PUBLIC cxx_std_20)
+target_link_libraries(geode_core PUBLIC terrain_biomes GeodeCubiomes::Java263 Threads::Threads)
+target_compile_options(terrain_biomes PRIVATE -O3 -fwrapv -ffp-contract=off -ffunction-sections -fdata-sections)
+target_compile_options(geode_core PRIVATE -O3 -Wall -Wextra -ffp-contract=off -ffunction-sections -fdata-sections)
+
+if(GEODE_BUILD_CLI)
+    add_executable(geode-finder src/main.cpp src/protocol.cpp)
+    target_include_directories(geode-finder PRIVATE third_party)
+    target_link_libraries(geode-finder PRIVATE MinecraftFinders::Geode)
+    target_link_options(geode-finder PRIVATE -static -static-libgcc -static-libstdc++ -Wl,--gc-sections -s)
     if(WIN32)
         target_link_options(geode-finder PRIVATE -municode)
     endif()
 endif()
+
+option(GEODE_BUILD_EXAMPLE "构建直接调用算法库的示例" OFF)
+if(GEODE_BUILD_EXAMPLE)
+    add_executable(geode-example examples/basic.cpp)
+    target_link_libraries(geode-example PRIVATE MinecraftFinders::Geode)
+    if(WIN32)
+        target_link_options(geode-example PRIVATE -static -static-libgcc -static-libstdc++)
+    endif()
+endif()
+
 option(BUILD_TESTING "Build local regression tests" OFF)
 include(CTest)
-if(BUILD_TESTING)
+if(BUILD_TESTING AND GEODE_BUILD_CLI)
     if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit.cpp")
         message(FATAL_ERROR "Local tests/ is not included in this repository. Use -DBUILD_TESTING=OFF to build the engine.")
     endif()
@@ -90,7 +105,10 @@ if(BUILD_TESTING)
     add_test(NAME unit COMMAND geode-unit)
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_FOUND)
+        add_test(NAME cli-config COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_config.py $<TARGET_FILE:geode-finder>)
         add_test(NAME checkpoint COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/checkpoint.py
+                                         $<TARGET_FILE:geode-finder>)
+        add_test(NAME ranges COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/range_check.py
                                          $<TARGET_FILE:geode-finder>)
         add_test(NAME versions26 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/version26_check.py
                                          $<TARGET_FILE:geode-finder> $<TARGET_FILE:geode-terrain-check>)
@@ -108,6 +126,8 @@ if(BUILD_TESTING)
                                       $<TARGET_FILE:geode-terrain-check> $<TARGET_FILE:geode-finder>)
         add_test(NAME early-versions COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/early_version_check.py
                                              $<TARGET_FILE:geode-terrain-check> $<TARGET_FILE:geode-finder>)
+        add_test(NAME version-sampling COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/version_sampling_check.py
+                                               $<TARGET_FILE:geode-terrain-check> $<TARGET_FILE:geode-finder>)
         add_test(NAME world COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/world_check.py
                                     $<TARGET_FILE:geode-terrain-check> $<TARGET_FILE:geode-finder>)
         add_test(NAME hotspot-quality COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/hotspot_check.py

@@ -1,0 +1,17 @@
+*.c linguist-language=C
+*.h linguist-language=C
+
+
+# 固定源码副本字节，避免core.autocrlf改变锁文件校验。
+*.c text eol=lf
+*.h text eol=lf
+LICENSE text eol=lf
+.gitattributes text eol=lf
+*.hpp text eol=lf
+*.cpp text eol=lf
+*.java text eol=lf
+*.py text eol=lf
+*.json text eol=lf
+*.tsv text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf

@@ -142,11 +142,12 @@ class SearchCheckpoint {
             return;
         // 生成逻辑、归组或任务归属变化时，必须更新模型/工作划分修订。
         std::ostringstream signature;
-        signature << "geode-native-v1;model=20261025;work=512-4096-64;int=" << sizeof(int) << ";seed=" << o.seed << ';'
+        signature << "geode-native-v2;model=20261027-range;work=512-4096-64;int=" << sizeof(int) << ";seed=" << o.seed << ';'
                   << o.version << ';' << o.generation << ';' << o.terrain << ';' << o.modern << ';' << o.center_x << ';'
                   << o.center_z << ';' << o.radius << ';' << o.shape << ';' << o.full_world << ';' << o.tick_radius
                   << ';' << o.simulation_distance << ';' << o.min_geodes << ';' << o.min_budding << ';' << o.prefilter
-                  << ';' << o.limit << ';' << o.threads << ';' << o.scan_backend << ';' << kRankingRuleVersion;
+                  << ';' << o.limit << ';' << o.threads << ';' << o.scan_backend << ';' << kRankingRuleVersion
+                  << ';' << o.coverage << ';' << o.inner_radius << ';' << CUBIOMES_REVISION;
         journal = std::make_unique<CheckpointJournal>(o.checkpoint_directory, signature.str());
         journal->replay([&](CheckpointRecord &record) {
             if (o.checkpoint)
@@ -384,7 +385,9 @@ bool Options::intersects_chunk(int x, int z) const {
 }
 
 int Options::activity_radius() const {
-    return modern ? simulation_distance : (tick_radius + 15) / 16;
+    if (custom())
+        return (inner_radius + 15) / 16 + 1;
+    return modern ? std::min(simulation_distance, 31) : (tick_radius + 15) / 16;
 }
 
 void expand_full_world(Options &o) {
@@ -393,6 +396,44 @@ void expand_full_world(Options &o) {
     o.radius = 30000000;
     o.shape = "square";
     o.full_world = true;
+}
+
+const std::vector<std::string> &versions() {
+    static const std::vector<std::string> values = {
+        "1.18",
+        "1.18.1",
+        "1.18.2",
+        "1.19",
+        "1.19.1",
+        "1.19.2",
+        "1.19.3",
+        "1.19.4",
+        "1.20",
+        "1.20.1",
+        "1.20.2",
+        "1.20.3",
+        "1.20.4",
+        "1.20.5",
+        "1.20.6",
+        "1.21",
+        "1.21.1",
+        "1.21.2",
+        "1.21.3",
+        "1.21.4",
+        "1.21.5",
+        "1.21.6",
+        "1.21.7",
+        "1.21.8",
+        "1.21.9",
+        "1.21.10",
+        "1.21.11",
+        "26.1",
+        "26.1.1",
+        "26.1.2",
+        "26.2",
+        "26.3",
+    };
+    return values;
 }
 
 void set_version(Options &o, const std::string &text) {
@@ -420,14 +461,43 @@ void set_version(Options &o, const std::string &text) {
 }
 
 bool active(const Options &o, int px, int pz, int cx, int cz) {
-    if (o.modern)
-        return std::abs(floor_div(px, 16) - cx) <= o.simulation_distance &&
-               std::abs(floor_div(pz, 16) - cz) <= o.simulation_distance;
+    if (o.chunk_constant())
+        return std::abs(floor_div(px, 16) - cx) <= o.activity_radius() &&
+               std::abs(floor_div(pz, 16) - cz) <= o.activity_radius();
+    if (o.custom())
+        return active_point(o, px, pz, cx * 16 + 8, cz * 16 + 8);
     int64_t dx = int64_t(cx) * 16 + 8 - px, dz = int64_t(cz) * 16 + 8 - pz;
     return dx * dx + dz * dz < int64_t(o.tick_radius) * o.tick_radius;
 }
 
+bool active_point(const Options &o, int px, int pz, int x, int z) {
+    if (!o.custom())
+        return active(o, px, pz, floor_div(x, 16), floor_div(z, 16));
+    int64_t dx = int64_t(x) - px, dz = int64_t(z) - pz;
+    if (o.coverage == "square")
+        return std::abs(dx) <= o.inner_radius && std::abs(dz) <= o.inner_radius;
+    return dx * dx + dz * dz <= int64_t(o.inner_radius) * o.inner_radius;
+}
+
+std::pair<int, int> coarse_span(const Options &o, int dz) {
+    if (o.chunk_constant()) {
+        int q = o.activity_radius();
+        return std::abs(dz) <= q ? std::pair{-q, q} : std::pair{0, -1};
+    }
+    int distance = dz > 0 ? dz * 16 - 7 : dz < 0 ? -dz * 16 - 8 : 0;
+    int radius = o.custom() ? o.inner_radius : o.tick_radius;
+    int64_t remaining = int64_t(radius) * radius - (o.custom() ? 0 : 1) - int64_t(distance) * distance;
+    if (o.coverage == "square")
+        remaining = distance <= radius ? int64_t(radius) * radius : -1;
+    if (remaining < 0)
+        return {0, -1};
+    int reach = isqrt(remaining);
+    return {-((reach + 8) / 16), (reach + 7) / 16};
+}
+
 bool same_hotspot(const Options &o, Center a, Center b) {
+    if (o.custom())
+        return active_point(o, a.x, a.z, b.x, b.z);
     return active(o, a.x, a.z, floor_div(b.x, 16), floor_div(b.z, 16)) &&
            active(o, b.x, b.z, floor_div(a.x, 16), floor_div(a.z, 16));
 }
@@ -467,7 +537,7 @@ Center optimize(const Options &o, int cx, int cz, const std::vector<Weight> &wei
                 const std::vector<Weight> &origins) {
     Center best;
     int bx = cx * 16, bz = cz * 16;
-    if (o.modern) {
+    if (o.chunk_constant()) {
         int sum = 0, geodes = 0;
         for (auto w : weights)
             if (active(o, bx, bz, w.x, w.z))
@@ -485,11 +555,15 @@ Center optimize(const Options &o, int cx, int cz, const std::vector<Weight> &wei
         return best;
     }
     int diff[16][17]{}, geode_diff[16][17]{};
-    auto accumulate = [&](const std::vector<Weight> &source, int (&layer)[16][17]) {
+    auto accumulate = [&](const std::vector<Weight> &source, int (&layer)[16][17], bool blocks) {
         for (auto w : source) {
-            int tx = w.x * 16 + 8, tz = w.z * 16 + 8;
+            int tx = blocks ? w.x : w.x * 16 + 8, tz = blocks ? w.z : w.z * 16 + 8;
             for (int z = 0; z < 16; ++z) {
-                int64_t dz = int64_t(tz) - bz - z, remaining = int64_t(o.tick_radius) * o.tick_radius - 1 - dz * dz;
+                int radius = o.custom() ? o.inner_radius : o.tick_radius;
+                int64_t dz = int64_t(tz) - bz - z;
+                int64_t remaining = int64_t(radius) * radius - (o.custom() ? 0 : 1) - dz * dz;
+                if (o.coverage == "square")
+                    remaining = std::abs(dz) <= radius ? int64_t(radius) * radius : -1;
                 if (remaining < 0)
                     continue;
                 int reach = isqrt(remaining), lo = std::max(0, tx - reach - bx), hi = std::min(15, tx + reach - bx);
@@ -500,8 +574,8 @@ Center optimize(const Options &o, int cx, int cz, const std::vector<Weight> &wei
             }
         }
     };
-    accumulate(weights, diff);
-    accumulate(origins, geode_diff);
+    accumulate(weights, diff, o.custom());
+    accumulate(origins, geode_diff, false);
     for (int z = 0; z < 16; ++z) {
         int sum = 0, geodes = 0;
         for (int x = 0; x < 16; ++x) {
@@ -532,7 +606,7 @@ Center evaluate(const Options &o, int px, int pz) {
                     ++out.geodes;
                 for (auto b : s.budding)
                     if (in_world(floor_div(b.x, 16), floor_div(b.z, 16)) &&
-                        active(o, px, pz, floor_div(b.x, 16), floor_div(b.z, 16)))
+                        active_point(o, px, pz, b.x, b.z))
                         ++out.budding;
             }
     return out;
@@ -639,18 +713,9 @@ Results search(const Options &o, const std::function<void(const std::string &, u
 
             std::vector<Span> footprint;
             for (int dz = -r; dz <= r; ++dz) {
-                if (o.modern) {
-                    if (std::abs(dz) <= o.simulation_distance)
-                        footprint.push_back({dz, -o.simulation_distance, o.simulation_distance});
-                } else {
-                    // 取该区块内任意整数玩家位置可激活的来源中心并集。
-                    int distance = dz > 0 ? dz * 16 - 7 : dz < 0 ? -dz * 16 - 8 : 0;
-                    int64_t remaining = int64_t(o.tick_radius) * o.tick_radius - 1 - int64_t(distance) * distance;
-                    if (remaining >= 0) {
-                        int reach = isqrt(remaining);
-                        footprint.push_back({dz, -((reach + 8) / 16), (reach + 7) / 16});
-                    }
-                }
+                auto [lo, hi] = coarse_span(o, dz);
+                if (lo <= hi)
+                    footprint.push_back({dz, lo, hi});
             }
             parallel(size_t(tiles_x) * tiles_z, nthreads, [&](size_t tile, int id) {
                 checkpoint();
@@ -679,10 +744,10 @@ Results search(const Options &o, const std::function<void(const std::string &, u
                     return;
                 }
                 int width = bx - ax + 1 + 2 * r, height = bz - az + 1 + 2 * r, stride = width + 1;
-                if (o.modern) {
+                if (o.chunk_constant()) {
                     // 方形滑窗只维护进入/离开行与各列总数。
                     // 保留双阈值；历史Java候选池相差一个24位随机数取值。
-                    int q = o.simulation_distance, diameter = 2 * q + 1;
+                    int q = o.activity_radius(), diameter = 2 * q + 1;
                     std::vector<uint8_t> history(size_t(width) * diameter);
                     std::vector<int> columns(width), old_columns(width);
                     std::vector<uint32_t> placements(width);
@@ -734,8 +799,8 @@ Results search(const Options &o, const std::function<void(const std::string &, u
                         b += bits < 699050;
                         size_t p = size_t(z + 1) * stride + x + 1;
                         area[p] = area[p - stride] + a;
-                        prefix[p] = o.modern ? area[p] : a;
-                        old[p] = o.modern ? old[p - stride] + b : b;
+                        prefix[p] = o.chunk_constant() ? area[p] : a;
+                        old[p] = o.chunk_constant() ? old[p - stride] + b : b;
                     }
                 }
                 auto rectangle = [&](const std::vector<int> &p, int x0, int z0, int x1, int z1) {
@@ -745,7 +810,7 @@ Results search(const Options &o, const std::function<void(const std::string &, u
                 int q = o.activity_radius();
                 auto sum = [&](const std::vector<int> &p, int x, int z) {
                     int cx = x - ax + r, cz = z - az + r;
-                    if (o.modern)
+                    if (o.chunk_constant())
                         return rectangle(p, cx - q, cz - q, cx + q + 1, cz + q + 1);
                     int count = 0;
                     for (auto span : footprint) {
@@ -938,7 +1003,7 @@ Results search(const Options &o, const std::function<void(const std::string &, u
                 for (auto p : s.budding) {
                     int cx = floor_div(p.x, 16), cz = floor_div(p.z, 16);
                     if (in_world(cx, cz))
-                        ++weights[key(cx, cz)];
+                        ++weights[o.custom() ? key(p.x, p.z) : key(cx, cz)];
                 }
             }
         if (saved.enabled())
@@ -966,6 +1031,25 @@ Results search(const Options &o, const std::function<void(const std::string &, u
         for (auto k : local_origins[id])
             origins.emplace(k, 1);
     }
+    // 自定义范围按母岩实际XZ统计；按区块建立索引，避免每个候选遍历全部母岩。
+    std::unordered_map<uint64_t, std::vector<Weight>> point_buckets;
+    if (o.custom())
+        for (auto [k, count] : weights) {
+            int x = int(int32_t(k >> 32)), z = int(int32_t(k));
+            point_buckets[key(floor_div(x, 16), floor_div(z, 16))].push_back({x, z, count});
+        }
+    auto gather_weights = [&](int cx, int cz, int radius) {
+        if (!o.custom())
+            return gather(weights, cx, cz, radius);
+        std::vector<Weight> result;
+        for (int z = cz - radius; z <= cz + radius; ++z)
+            for (int x = cx - radius; x <= cx + radius; ++x) {
+                auto it = point_buckets.find(key(x, z));
+                if (it != point_buckets.end())
+                    result.insert(result.end(), it->second.begin(), it->second.end());
+            }
+        return result;
+    };
     out.stats.weights = weights.size();
     out.stats.simulate_ms = saved.simulation_ms(simulation_start, simulation_paused);
     auto rank_start = Clock::now();
@@ -983,7 +1067,7 @@ Results search(const Options &o, const std::function<void(const std::string &, u
     parallel(candidates.size(), nthreads, [&](size_t i, int) {
         checkpoint();
         auto c = candidates[i];
-        auto nearby = gather(weights, c.x, c.z, o.activity_radius() + 1);
+        auto nearby = gather_weights(c.x, c.z, o.activity_radius() + 1);
         int x = c.x * 16 + 8, z = c.z * 16 + 8;
         if (!o.contains(x, z)) {
             x = std::clamp(o.center_x, c.x * 16, c.x * 16 + 15);
@@ -992,11 +1076,12 @@ Results search(const Options &o, const std::function<void(const std::string &, u
         int bound = 0;
         Center score{x, z, 0, 0};
         for (auto w : nearby) {
-            int px = std::clamp(w.x * 16 + 8, c.x * 16, c.x * 16 + 15),
-                pz = std::clamp(w.z * 16 + 8, c.z * 16, c.z * 16 + 15);
-            if (active(o, px, pz, w.x, w.z))
+            int wx = o.custom() ? w.x : w.x * 16 + 8, wz = o.custom() ? w.z : w.z * 16 + 8;
+            int px = std::clamp(wx, c.x * 16, c.x * 16 + 15),
+                pz = std::clamp(wz, c.z * 16, c.z * 16 + 15);
+            if (active_point(o, px, pz, wx, wz))
                 bound += w.budding;
-            if (active(o, x, z, w.x, w.z))
+            if (active_point(o, x, z, wx, wz))
                 score.budding += w.budding;
         }
         for (auto w : gather(origins, c.x, c.z, o.activity_radius()))
@@ -1061,7 +1146,7 @@ Results search(const Options &o, const std::function<void(const std::string &, u
             auto source = gather(origins, p.chunk.x, p.chunk.z, o.activity_radius());
             if (source.empty())
                 continue;
-            auto c = optimize(o, p.chunk.x, p.chunk.z, gather(weights, p.chunk.x, p.chunk.z, o.activity_radius() + 1),
+            auto c = optimize(o, p.chunk.x, p.chunk.z, gather_weights(p.chunk.x, p.chunk.z, o.activity_radius() + 1),
                               source);
             ++optimized;
             if (center_better(c, best))
