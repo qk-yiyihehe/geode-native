@@ -6,7 +6,7 @@
 #undef lerp
 #include "generator.h"
 
-namespace trial {
+namespace geode_layout {
 struct Climate263::Impl {
     Generator generator;
 

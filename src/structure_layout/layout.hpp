@@ -7,11 +7,11 @@
 #include <memory>
 #include <vector>
 struct Generator;
-extern "C" Generator *trial_biomes_create(uint64_t seed);
-extern "C" void trial_biomes_free(Generator *generator);
-extern "C" int trial_biomes_allowed(Generator *generator, int x, int y, int z);
+extern "C" Generator *geode_biomes_create(uint64_t seed);
+extern "C" void geode_biomes_free(Generator *generator);
+extern "C" int geode_biomes_allowed(Generator *generator, int x, int y, int z);
 
-namespace trial {
+namespace geode_layout {
 struct Vec3 {
     int x{}, y{}, z{};
     auto operator<=>(const Vec3 &) const = default;

@@ -118,6 +118,8 @@ int run(int argc, char **argv) {
                          "统计: --coverage game|circle|square --inner-radius 128 --inner-radius-unit blocks|chunks\n"
                          "      --simulation-distance 10 --simulation-distance-unit chunks|blocks\n"
                          "      --min-geodes 1 --min-budding 1 --prefilter-limit 200000 --scan-backend auto|cpu|gpu\n"
+                         "      --min-x X --max-x X --min-z Z --max-z Z: 精确四至矩形(闭区间；排名中心取中点)，--rect 用默认矩形\n"
+                         "      --scan-threads N: 粗筛线程数(1..256，模拟仍用--threads)；--checkpoint-region 区块: 断点聚合区域\n"
                          "桌面: --desktop (协议v3，stdin/stdout JSONL，不读取CLI配置)\n"
                          "开发: --model terrain|stone --samples 文件.json；--help只显示入口用法\n"
                          "配置键为CLI参数名去掉--，命令行覆盖配置；输出目录由--output指定。\n";
@@ -141,13 +143,33 @@ int run(int argc, char **argv) {
         o.center_x = number("--center-x", 0);
         o.center_z = number("--center-z", 0);
         o.shape = text("--shape", "circle");
-        o.tick_radius = number("--tick-radius", 128);
-        o.coverage = text("--coverage", "game");
+        // 精确四至（闭区间）：给了任一四至就要求给全，--rect 使用默认矩形。
+        const bool any_bound = args.contains("--min-x") || args.contains("--max-x") || args.contains("--min-z") ||
+                               args.contains("--max-z");
+        const bool all_bound = args.contains("--min-x") && args.contains("--max-x") && args.contains("--min-z") &&
+                               args.contains("--max-z");
+        if (any_bound && !all_bound)
+            throw std::invalid_argument("--min-x/--max-x/--min-z/--max-z must be given together");
+        if (any_bound || args.contains("--rect")) {
+            o.search_rect = true;
+            o.min_x = number("--min-x", -16384);
+            o.max_x = number("--max-x", 16383);
+            o.min_z = number("--min-z", -16384);
+            o.max_z = number("--max-z", 16383);
+            // 矩形模式的排名中心取四至中点（向零截断）。
+            o.center_x = int((int64_t(o.min_x) + o.max_x) / 2);
+            o.center_z = int((int64_t(o.min_z) + o.max_z) / 2);
+            o.radius = std::max(o.max_x - o.min_x, o.max_z - o.min_z) / 2 + 1;
+            o.shape = "rect";
+        }
+        o.tick_radius = number("--tick-radius", 128);        o.coverage = text("--coverage", "game");
         o.inner_radius = range_units::text(text("--inner-radius", "128"),
                                           text("--inner-radius-unit", "blocks"));
         o.simulation_distance = range_units::text(text("--simulation-distance", "10"),
                                                  text("--simulation-distance-unit", "chunks"), true);
         o.threads = number("--threads", 8);
+        o.scan_threads = number("--scan-threads", 0);
+        o.checkpoint_region = number("--checkpoint-region", 0);
         o.min_geodes = number("--min-geodes", 1);
         o.min_budding = number("--min-budding", 1);
         o.prefilter = number("--prefilter-limit", 0);
@@ -165,7 +187,11 @@ int run(int argc, char **argv) {
             o.inner_radius > 60000000 || o.radius < 1 || o.radius > 60000000 || std::abs(int64_t(o.center_x)) > 30000000 ||
             std::abs(int64_t(o.center_z)) > 30000000 || o.threads < 1 || o.threads > 64 || o.tick_radius < 1 ||
             o.tick_radius > 1024 || o.simulation_distance < 2 || o.simulation_distance > 32 || o.prefilter < 0 ||
-            o.min_geodes < 1 || o.min_budding < 0 || o.limit < 1 || (o.shape != "circle" && o.shape != "square"))
+            o.min_geodes < 1 || o.min_budding < 0 || o.limit < 1 ||
+            (o.shape != "circle" && o.shape != "square" && o.shape != "rect") || o.scan_threads < 0 ||
+            o.scan_threads > 256 || o.checkpoint_region < 0 || o.checkpoint_region > 1000000 ||
+            (o.search_rect && (o.min_x > o.max_x || o.min_z > o.max_z || o.min_x < -30000000 || o.max_x > 29999999 ||
+                               o.min_z < -30000000 || o.max_z > 29999999)))
             throw std::invalid_argument("Invalid search/radius/thread/threshold setting");
         if (args.contains("--full-world"))
             expand_full_world(o);
@@ -199,6 +225,13 @@ int run(int argc, char **argv) {
                                                  "--samples",
                                                  "--scan-backend",
                                                  "--checkpoint-dir",
+                                                 "--checkpoint-region",
+                                                 "--scan-threads",
+                                                 "--min-x",
+                                                 "--max-x",
+                                                 "--min-z",
+                                                 "--max-z",
+                                                 "--rect",
                                                  "--no-checkpoint"};
         for (auto &[k, v] : args)
             if (!supported.contains(k))
@@ -261,7 +294,8 @@ int run(int argc, char **argv) {
                 o.modern ? "simulation-distance-square-java-compatible" : "legacy-chunk-center-circle"},
             {"model", o.terrain ? "terrain-control-estimate" : "stone-estimate"},
             {"verified", false},
-            {"searchApproximate", o.prefilter != 0},
+            {"searchApproximate", output.approximate},
+            {"cancelled", output.cancelled},
             {"candidateChunkOptimization", "exact-integer"},
             {"rankingUnit", "distinct-hotspot"},
             {"parameters",
@@ -269,6 +303,11 @@ int run(int argc, char **argv) {
               {"centerZ", o.center_z},
               {"radius", o.radius},
               {"shape", o.shape},
+              {"searchRect", o.search_rect},
+              {"minX", o.search_rect ? o.min_x : o.center_x - o.radius},
+              {"maxX", o.search_rect ? o.max_x : o.center_x + o.radius},
+              {"minZ", o.search_rect ? o.min_z : o.center_z - o.radius},
+              {"maxZ", o.search_rect ? o.max_z : o.center_z + o.radius},
               {"tickRadius", o.tick_radius},
               {"simulationDistance", o.simulation_distance},
               {"coverage", o.coverage},
@@ -278,6 +317,8 @@ int run(int argc, char **argv) {
               {"minBudding", o.min_budding},
               {"prefilterLimit", o.prefilter},
               {"threads", o.threads},
+              {"scanThreads", o.scan_threads > 0 ? o.scan_threads : o.threads},
+              {"checkpointRegion", o.checkpoint_region},
               {"limit", o.limit}}},
             {"stats",
              {{"scanBackend", s.scan_backend},

@@ -1,6 +1,10 @@
 #pragma once
 #include "geode.hpp"
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
@@ -16,6 +20,15 @@ struct Options {
     int inner_radius = 128;
     int center_x = 0, center_z = 0, radius = 10000, tick_radius = 128, simulation_distance = 10;
     int min_geodes = 1, min_budding = 1, prefilter = 0, limit = 100, threads = 8;
+    // search_rect = true 时使用精确四至（闭区间），忽略 center/radius/shape。
+    // 四至的排名中心取 (min+max)/2，与协议 bounds 的 center 一致。
+    bool search_rect = false;
+    int min_x = 0, max_x = 0, min_z = 0, max_z = 0;
+    // 0 = 与 threads 相同；大于 threads 时只提高粗筛并行度，模拟仍用 threads。
+    int scan_threads = 0;
+    // 0 = 逐 512 区块瓦片记录断点（旧行为）；>0 = 按该区块边长的区域聚合断点。
+    // 全图搜索应设为 8192（131,072 方块），避免 5,000 万瓦片的断点爆炸。
+    int checkpoint_region = 0;
     bool modern = false, terrain = true, full_world = false;
     int generation = 1;
     std::function<void()> checkpoint;
@@ -34,6 +47,38 @@ void set_version(Options &o, const std::string &version);
 // 全图简写必须先展开，再计算排名距离，
 // 确保实际榜单中心为原点，而不是用户输入但未生效的中心。
 void expand_full_world(Options &o);
+
+// 协作式暂停/取消：工作线程在检查点阻塞或抛出 Cancelled。
+// 与旧的 Options::checkpoint 相比，暂停延迟为一个工作单位，且取消可正常收敛。
+struct Cancelled {};
+
+class Control {
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::atomic<bool> paused_{};
+    std::atomic<bool> cancelled_{};
+    std::atomic<int> waiting_{};
+    std::chrono::steady_clock::time_point paused_at_{};
+    std::chrono::steady_clock::duration paused_time_{};
+
+  public:
+    void checkpoint();
+    void pause();
+    void resume();
+    void cancel();
+    bool paused() const {
+        return paused_.load(std::memory_order_relaxed);
+    }
+    bool cancelled() const {
+        return cancelled_.load(std::memory_order_relaxed);
+    }
+    // 当前阻塞在检查点等待恢复的工作线程数；宿主可用它确认暂停已生效。
+    int waiting() const {
+        return waiting_.load(std::memory_order_relaxed);
+    }
+    // 累计暂停毫秒，含当前尚未恢复的暂停段。
+    double paused_ms();
+};
 
 struct Weight {
     int x, z, budding;
@@ -77,11 +122,22 @@ struct Results {
     std::vector<Center> centers;
     Stats stats;
     std::string checkpoint_path;
+    // G-UP1：Control 取消时正常返回，不抛异常。
+    bool cancelled = false;
+    // G-UP5：引擎直接给出结果语义，宿主不再推断。
+    bool approximate = false;
+    int ranking_rule_version = kRankingRuleVersion;
+    std::string scan_backend = "cpu";
 };
 
 // 进度回调：阶段名、阶段内完成量、阶段内总量、已扫描区块数。
 // 第四个参数让界面在运行中显示真实扫描量，而不是等结果才知道。
 using ProgressFn = std::function<void(const std::string &, uint64_t, uint64_t, uint64_t)>;
+using Progress = ProgressFn;
+// 后端回调：本次运行实际使用的粗筛后端（如 cpu / gpu）与人类可读说明。
+using Backend = std::function<void(const std::string &, const std::string &)>;
 
-Results search(const Options &o, const ProgressFn &progress = {});
+Results search(const Options &o, const ProgressFn &progress = {}, const Backend &backend = {});
+// 可暂停/可取消的重载；旧 Options::checkpoint 仍会在此路径生效。
+Results search(const Options &o, Control &control, const ProgressFn &progress = {}, const Backend &backend = {});
 }

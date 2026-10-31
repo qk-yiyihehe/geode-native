@@ -4,7 +4,7 @@
 #include <stdexcept>
 #include <tuple>
 
-namespace trial {
+namespace geode_layout {
 #include "trial_data.hpp"
 #include "city_data.hpp"
 
@@ -166,7 +166,8 @@ bool LayoutEngine::Space::fits(Box box) {
 }
 
 LayoutEngine::LayoutEngine(int generation, uint64_t seed)
-    : tables_(tables(generation)), seed_(seed), biomes_(generation < 5 ? trial_biomes_create(seed) : nullptr, trial_biomes_free),
+    : tables_(tables(generation)), seed_(seed),
+      biomes_(generation < 5 ? geode_biomes_create(seed) : nullptr, geode_biomes_free),
       aliases_(tables_.data.pools.size()), rejected_(tables_.data.templates.size()) {
     if (generation >= 5)
         climate263_ = std::make_unique<Climate263>(seed);
@@ -271,7 +272,7 @@ Chamber LayoutEngine::generate(int cx, int cz) {
     bool outside_deep_dark = climate263_
                                  ? climate263_->allowed(floor_div(biome_pos.x, 4) * 4, floor_div(biome_pos.y, 4) * 4,
                                                         floor_div(biome_pos.z, 4) * 4)
-                                 : trial_biomes_allowed(biomes_.get(), floor_div(biome_pos.x, 4),
+                                 : geode_biomes_allowed(biomes_.get(), floor_div(biome_pos.x, 4),
                                                         floor_div(biome_pos.y, 4), floor_div(biome_pos.z, 4));
     if (outside_deep_dark == data.deep_dark)
         return result;

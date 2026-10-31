@@ -3,7 +3,7 @@
 #include <memory>
 #include <utility>
 
-namespace trial {
+namespace geode_layout {
 class Climate263 {
     struct Impl;
     std::unique_ptr<Impl> impl_;
